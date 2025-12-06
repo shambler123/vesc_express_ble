@@ -22,6 +22,7 @@ set(COMPONENT_SRCS
 "flash_helper.c"
 "rb.c"
 "bms.c"
+"jbd_bms_ble.c"
 "log_comm.c"
 "digital_filter.c"
 

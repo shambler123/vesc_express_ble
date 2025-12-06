@@ -27,7 +27,11 @@
 #include "driver/gpio.h"
 #include "esp_wifi.h"
 #include "esp_bt.h"
+#ifdef CONFIG_BT_BLUEDROID_ENABLED
+#ifdef CONFIG_BT_BLUEDROID_ENABLED
 #include "esp_bt_main.h"
+#endif
+#endif
 #include "esp_sleep.h"
 
 #include "lispif.h"

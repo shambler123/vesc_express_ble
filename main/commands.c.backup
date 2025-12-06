@@ -74,13 +74,7 @@
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
-#ifdef CONFIG_BT_BLUEDROID_ENABLED
-#ifdef CONFIG_BT_BLUEDROID_ENABLED
-#ifdef CONFIG_BT_BLUEDROID_ENABLED
 #include "esp_bt_main.h"
-#endif
-#endif
-#endif
 #endif
 #endif
 #endif

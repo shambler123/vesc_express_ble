@@ -5,6 +5,6 @@
 
 #include "lispbm.h"
 
-void lispif_load_ble_extensions(void) {
+void lispif_ble_extensions_load(void) {
     // BLE extensions disabled with NimBLE
 }

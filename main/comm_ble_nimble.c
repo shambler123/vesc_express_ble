@@ -69,7 +69,6 @@ static bool is_connected = false;
 static uint16_t ble_current_mtu = DEFAULT_BLE_MTU;
 static uint16_t conn_handle = 0;
 static uint16_t tx_attr_handle = 0;
-static uint8_t own_addr_type;
 static PACKET_STATE_t *packet_state;
 
 static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -111,15 +110,10 @@ static int gatt_svr_chr_access(uint16_t conn_h, uint16_t attr_handle,
     if (ble_uuid_cmp(uuid, &gatt_svr_chr_rx_uuid.u) == 0) {
         if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
             // Process incoming data
-            uint16_t om_len = OS_MBUF_PKTLEN(ctxt->om);
-            uint8_t *data = malloc(om_len);
-            if (data) {
-                uint16_t copied = 0;
-                os_mbuf_copydata(ctxt->om, 0, om_len, data);
-                for (int i = 0; i < om_len; i++) {
-                    packet_process_byte(data[i], packet_state);
-                }
-                free(data);
+            for (int i = 0; i < OS_MBUF_PKTLEN(ctxt->om); i++) {
+                uint8_t byte;
+                os_mbuf_copydata(ctxt->om, i, 1, &byte);
+                packet_process_byte(byte, packet_state);
             }
             return 0;
         }
@@ -218,7 +212,7 @@ static void ble_advertise(void) {
     adv_params.itvl_min = 0x20;
     adv_params.itvl_max = 0x40;
 
-    rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER,
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_handler, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Error starting advertising: rc=%d", rc);
@@ -228,14 +222,14 @@ static void ble_advertise(void) {
 static void ble_on_sync(void) {
     int rc;
 
-    rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    rc = ble_hs_id_infer_auto(0, &ble_svc_gap_device_addr);
     if (rc != 0) {
         ESP_LOGE(TAG, "Error determining address type: rc=%d", rc);
         return;
     }
 
     uint8_t addr_val[6] = {0};
-    rc = ble_hs_id_copy_addr(own_addr_type, addr_val, NULL);
+    rc = ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, addr_val, NULL);
     ESP_LOGI(TAG, "Device Address: %02x:%02x:%02x:%02x:%02x:%02x",
              addr_val[5], addr_val[4], addr_val[3],
              addr_val[2], addr_val[1], addr_val[0]);
