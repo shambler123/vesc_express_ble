@@ -1,8 +1,8 @@
 /*
- * jbd_bms_ble.c - NimBLE version v2
+ * jbd_bms_ble.c - NimBLE version v9
  * 
- * JBD BMS BLE Client for VESC Express using NimBLE stack
- * Fixed connection handling
+ * Try different advertising approach - use random address for advertising
+ * while connected as central with public address
  */
 
 #include "jbd_bms_ble.h"
@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -29,24 +30,28 @@
 #define TAG "JBD_BMS"
 #define VESC_PRINT(fmt, ...) commands_printf_lisp(fmt, ##__VA_ARGS__)
 
-#define CONN_TIMEOUT_MS     20000
+#define CONN_TIMEOUT_MS     10000
 #define RX_BUFFER_SIZE      256
 
-// JBD BMS UUIDs (16-bit)
 #define JBD_SVC_UUID        0xFF00
-#define JBD_RX_UUID         0xFF01  // Notify characteristic
-#define JBD_TX_UUID         0xFF02  // Write characteristic
+#define JBD_RX_UUID         0xFF01
+#define JBD_TX_UUID         0xFF02
 
 static jbd_bms_data_t m_bms_data;
 static SemaphoreHandle_t m_data_mutex = NULL;
+static TimerHandle_t m_adv_timer = NULL;
+static int m_adv_retry_count = 0;
+
+extern void comm_ble_restart_advertising(void);
+extern void comm_ble_check_advertising(void);
 
 static struct {
     volatile bool connecting;
     volatile bool connected;
     volatile bool service_found;
     volatile bool subscribed;
-    volatile bool connect_done;  // Connection attempt finished (success or fail)
-    volatile int connect_status; // Result of connection
+    volatile bool connect_done;
+    volatile int connect_status;
     uint16_t conn_handle;
     uint16_t svc_start_handle;
     uint16_t svc_end_handle;
@@ -67,14 +72,12 @@ static struct {
 static const uint8_t CMD_BASIC[] = {0xDD, 0xA5, 0x03, 0x00, 0xFF, 0xFD, 0x77};
 static const uint8_t CMD_CELLS[] = {0xDD, 0xA5, 0x04, 0x00, 0xFF, 0xFC, 0x77};
 
-// Forward declarations
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
 
 static bool parse_mac(const char *s, ble_addr_t *addr) {
     if (!s || strlen(s) < 17) return false;
     unsigned int t[6];
     if (sscanf(s, "%x:%x:%x:%x:%x:%x", &t[0],&t[1],&t[2],&t[3],&t[4],&t[5]) != 6) return false;
-    // NimBLE uses reversed byte order for address
     for (int i = 0; i < 6; i++) {
         addr->val[5-i] = (uint8_t)t[i];
     }
@@ -133,8 +136,6 @@ static void parse_cells(void) {
 }
 
 static void handle_notify(const uint8_t *data, size_t len) {
-    VESC_PRINT("JBD: RX %d bytes", (int)len);
-    
     if (len >= 4 && data[0] == 0xDD) {
         m_rx.receiving = true;
         m_rx.idx = 0;
@@ -154,10 +155,50 @@ static void handle_notify(const uint8_t *data, size_t len) {
     }
 }
 
+// Timer callback for advertising restart
+static void adv_timer_cb(TimerHandle_t xTimer) {
+    m_adv_retry_count++;
+    VESC_PRINT("JBD: Adv timer #%d, adv=%d", m_adv_retry_count, ble_gap_adv_active());
+    
+    if (ble_gap_adv_active()) {
+        VESC_PRINT("JBD: Adv already active!");
+        return;
+    }
+    
+    // Try both the restart and the check
+    comm_ble_restart_advertising();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    comm_ble_check_advertising();
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    if (ble_gap_adv_active()) {
+        VESC_PRINT("JBD: Adv started OK!");
+    } else if (m_adv_retry_count < 60) {
+        // Retry - use longer delays
+        int delay = 3000;
+        xTimerChangePeriod(m_adv_timer, pdMS_TO_TICKS(delay), 0);
+        xTimerStart(m_adv_timer, 0);
+    } else {
+        VESC_PRINT("JBD: Gave up on advertising after 60 tries");
+    }
+}
+
+static void schedule_adv_restart(void) {
+    m_adv_retry_count = 0;
+    if (!m_adv_timer) {
+        m_adv_timer = xTimerCreate("adv_timer", pdMS_TO_TICKS(3000), pdFALSE, NULL, adv_timer_cb);
+    }
+    if (m_adv_timer) {
+        VESC_PRINT("JBD: Scheduling adv restart in 3s");
+        xTimerStart(m_adv_timer, 0);
+    }
+}
+
 static int subscribe_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                         struct ble_gatt_attr *attr, void *arg) {
     if (error->status == 0) {
-        VESC_PRINT("JBD: Subscribed OK");
+        VESC_PRINT("JBD: Subscribed! h=%d", conn_handle);
         m_conn.subscribed = true;
         m_conn.connected = true;
         m_conn.connecting = false;
@@ -167,9 +208,12 @@ static int subscribe_cb(uint16_t conn_handle, const struct ble_gatt_error *error
             m_bms_data.connected = true;
             xSemaphoreGive(m_data_mutex);
         }
-        VESC_PRINT("JBD: *** CONNECTED ***");
+        VESC_PRINT("JBD: *** BMS CONNECTED (h=%d) ***", m_conn.conn_handle);
+        
+        // Schedule advertising restart
+        schedule_adv_restart();
     } else {
-        VESC_PRINT("JBD: Subscribe failed: %d", error->status);
+        VESC_PRINT("JBD: Subscribe fail: %d", error->status);
         m_conn.connect_done = true;
         m_conn.connect_status = error->status;
     }
@@ -180,20 +224,12 @@ static int dsc_disced_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
                          uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg) {
     if (error->status == 0 && dsc != NULL) {
         if (ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
-            VESC_PRINT("JBD: CCCD h=0x%04x", dsc->handle);
             m_conn.cccd_handle = dsc->handle;
-            
             uint8_t value[2] = {0x01, 0x00};
-            int rc = ble_gattc_write_flat(conn_handle, dsc->handle, value, 2, subscribe_cb, NULL);
-            if (rc != 0) {
-                VESC_PRINT("JBD: Write CCCD fail: %d", rc);
-                m_conn.connect_done = true;
-                m_conn.connect_status = rc;
-            }
+            ble_gattc_write_flat(conn_handle, dsc->handle, value, 2, subscribe_cb, NULL);
         }
     } else if (error->status == BLE_HS_EDONE) {
         if (m_conn.cccd_handle == 0 && m_conn.rx_handle != 0) {
-            VESC_PRINT("JBD: CCCD not found, trying h+1");
             uint8_t value[2] = {0x01, 0x00};
             ble_gattc_write_flat(conn_handle, m_conn.rx_handle + 1, value, 2, subscribe_cb, NULL);
         }
@@ -205,26 +241,14 @@ static int chr_disced_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
                          const struct ble_gatt_chr *chr, void *arg) {
     if (error->status == 0 && chr != NULL) {
         uint16_t uuid16 = ble_uuid_u16(&chr->uuid.u);
-        VESC_PRINT("JBD: CHR 0x%04x h=0x%04x", uuid16, chr->val_handle);
-        
-        if (uuid16 == JBD_RX_UUID) {
-            m_conn.rx_handle = chr->val_handle;
-        } else if (uuid16 == JBD_TX_UUID) {
-            m_conn.tx_handle = chr->val_handle;
-        }
+        if (uuid16 == JBD_RX_UUID) m_conn.rx_handle = chr->val_handle;
+        else if (uuid16 == JBD_TX_UUID) m_conn.tx_handle = chr->val_handle;
     } else if (error->status == BLE_HS_EDONE) {
-        VESC_PRINT("JBD: CHR done RX=0x%04x TX=0x%04x", m_conn.rx_handle, m_conn.tx_handle);
-        
+        VESC_PRINT("JBD: RX=0x%04x TX=0x%04x", m_conn.rx_handle, m_conn.tx_handle);
         if (m_conn.rx_handle != 0) {
-            int rc = ble_gattc_disc_all_dscs(conn_handle, m_conn.rx_handle,
-                                              m_conn.svc_end_handle, dsc_disced_cb, NULL);
-            if (rc != 0) {
-                VESC_PRINT("JBD: DSC disc fail: %d", rc);
-                m_conn.connect_done = true;
-                m_conn.connect_status = rc;
-            }
+            ble_gattc_disc_all_dscs(conn_handle, m_conn.rx_handle,
+                                    m_conn.svc_end_handle, dsc_disced_cb, NULL);
         } else {
-            VESC_PRINT("JBD: RX char not found!");
             m_conn.connect_done = true;
             m_conn.connect_status = -1;
         }
@@ -236,26 +260,17 @@ static int svc_disced_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
                          const struct ble_gatt_svc *svc, void *arg) {
     if (error->status == 0 && svc != NULL) {
         uint16_t uuid16 = ble_uuid_u16(&svc->uuid.u);
-        VESC_PRINT("JBD: SVC 0x%04x h=%d-%d", uuid16, svc->start_handle, svc->end_handle);
-        
         if (uuid16 == JBD_SVC_UUID) {
             m_conn.service_found = true;
             m_conn.svc_start_handle = svc->start_handle;
             m_conn.svc_end_handle = svc->end_handle;
         }
     } else if (error->status == BLE_HS_EDONE) {
-        VESC_PRINT("JBD: SVC done found=%d", m_conn.service_found);
-        
         if (m_conn.service_found) {
-            int rc = ble_gattc_disc_all_chrs(conn_handle, m_conn.svc_start_handle,
-                                              m_conn.svc_end_handle, chr_disced_cb, NULL);
-            if (rc != 0) {
-                VESC_PRINT("JBD: CHR disc fail: %d", rc);
-                m_conn.connect_done = true;
-                m_conn.connect_status = rc;
-            }
+            ble_gattc_disc_all_chrs(conn_handle, m_conn.svc_start_handle,
+                                    m_conn.svc_end_handle, chr_disced_cb, NULL);
         } else {
-            VESC_PRINT("JBD: Service not found!");
+            VESC_PRINT("JBD: Service not found");
             ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             m_conn.connect_done = true;
             m_conn.connect_status = -1;
@@ -267,21 +282,18 @@ static int svc_disced_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
 static int gap_event_cb(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
-            VESC_PRINT("JBD: GAP CONNECT st=%d", event->connect.status);
+            if (!m_conn.connecting) {
+                return 0;  // Not our connection
+            }
+            
+            VESC_PRINT("JBD: CONNECT st=%d h=%d", event->connect.status, event->connect.conn_handle);
             if (event->connect.status == 0) {
                 m_conn.conn_handle = event->connect.conn_handle;
-                VESC_PRINT("JBD: Connected h=%d, discovering...", m_conn.conn_handle);
-                
+                VESC_PRINT("JBD: BMS handle=%d", m_conn.conn_handle);
                 ble_uuid16_t svc_uuid = BLE_UUID16_INIT(JBD_SVC_UUID);
-                int rc = ble_gattc_disc_svc_by_uuid(event->connect.conn_handle,
-                                                    &svc_uuid.u, svc_disced_cb, NULL);
-                if (rc != 0) {
-                    VESC_PRINT("JBD: SVC disc fail: %d", rc);
-                    m_conn.connect_done = true;
-                    m_conn.connect_status = rc;
-                }
+                ble_gattc_disc_svc_by_uuid(event->connect.conn_handle,
+                                           &svc_uuid.u, svc_disced_cb, NULL);
             } else {
-                VESC_PRINT("JBD: Connect failed: %d", event->connect.status);
                 m_conn.connect_done = true;
                 m_conn.connect_status = event->connect.status;
                 m_conn.connecting = false;
@@ -289,15 +301,14 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
             break;
             
         case BLE_GAP_EVENT_DISCONNECT:
-            VESC_PRINT("JBD: DISCONNECT reason=%d", event->disconnect.reason);
+            if (event->disconnect.conn.conn_handle != m_conn.conn_handle) {
+                return 0;  // Not our connection
+            }
+            VESC_PRINT("JBD: BMS DISCONNECT h=%d", event->disconnect.conn.conn_handle);
             m_conn.connected = false;
             m_conn.connecting = false;
             m_conn.connect_done = true;
-            m_conn.service_found = false;
-            m_conn.subscribed = false;
-            m_conn.rx_handle = 0;
-            m_conn.tx_handle = 0;
-            m_conn.cccd_handle = 0;
+            m_conn.conn_handle = 0xFFFF;
             if (m_data_mutex && xSemaphoreTake(m_data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 m_bms_data.connected = false;
                 xSemaphoreGive(m_data_mutex);
@@ -305,26 +316,26 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
             break;
             
         case BLE_GAP_EVENT_NOTIFY_RX:
-            handle_notify(event->notify_rx.om->om_data, event->notify_rx.om->om_len);
-            break;
-            
-        case BLE_GAP_EVENT_MTU:
-            VESC_PRINT("JBD: MTU=%d", event->mtu.value);
-            break;
-            
-        case BLE_GAP_EVENT_CONN_UPDATE:
-            VESC_PRINT("JBD: Conn update");
+            if (event->notify_rx.conn_handle == m_conn.conn_handle) {
+                handle_notify(event->notify_rx.om->om_data, event->notify_rx.om->om_len);
+            }
             break;
             
         default:
-            VESC_PRINT("JBD: GAP ev=%d", event->type);
             break;
     }
     return 0;
 }
 
-static bool do_connect(uint8_t addr_type) {
-    m_conn.target_addr.type = addr_type;
+static void stop_all_gap_activity(void) {
+    ble_gap_adv_stop();
+    ble_gap_disc_cancel();
+    ble_gap_conn_cancel();
+    vTaskDelay(pdMS_TO_TICKS(500));
+}
+
+static bool do_connect(void) {
+    m_conn.target_addr.type = BLE_ADDR_PUBLIC;
     m_conn.connecting = true;
     m_conn.connected = false;
     m_conn.connect_done = false;
@@ -334,76 +345,63 @@ static bool do_connect(uint8_t addr_type) {
     m_conn.rx_handle = 0;
     m_conn.tx_handle = 0;
     m_conn.cccd_handle = 0;
+    m_conn.conn_handle = 0xFFFF;
     
-    const char *type_str = (addr_type == BLE_ADDR_RANDOM) ? "RANDOM" : "PUBLIC";
-    VESC_PRINT("JBD: Connecting (%s)...", type_str);
+    VESC_PRINT("JBD: Connecting...");
     
-    struct ble_gap_conn_params conn_params = {
-        .scan_itvl = 0x0010,
-        .scan_window = 0x0010,
-        .itvl_min = BLE_GAP_INITIAL_CONN_ITVL_MIN,
-        .itvl_max = BLE_GAP_INITIAL_CONN_ITVL_MAX,
-        .latency = 0,
-        .supervision_timeout = 0x0100,
-        .min_ce_len = 0,
-        .max_ce_len = 0,
-    };
-    
-    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &m_conn.target_addr,
-                              30000, &conn_params, gap_event_cb, NULL);
+    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &m_conn.target_addr, 10000, NULL, gap_event_cb, NULL);
     
     if (rc != 0) {
-        VESC_PRINT("JBD: ble_gap_connect failed: %d", rc);
+        VESC_PRINT("JBD: gap_connect err: %d", rc);
         m_conn.connecting = false;
         return false;
     }
     
-    // Wait for connection to complete
     uint32_t start = xTaskGetTickCount();
     while (!m_conn.connect_done && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(CONN_TIMEOUT_MS)) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     
-    if (m_conn.connected) {
-        return true;
-    }
+    if (m_conn.connected) return true;
     
-    // Timeout or failure - cancel if still connecting
     if (!m_conn.connect_done) {
-        VESC_PRINT("JBD: Timeout, cancelling...");
+        VESC_PRINT("JBD: Timeout, cancelling");
         ble_gap_conn_cancel();
-        vTaskDelay(pdMS_TO_TICKS(500));
+        uint32_t cancel_start = xTaskGetTickCount();
+        while (!m_conn.connect_done && (xTaskGetTickCount() - cancel_start) < pdMS_TO_TICKS(2000)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
     }
     
     m_conn.connecting = false;
+    vTaskDelay(pdMS_TO_TICKS(500));
     return false;
 }
 
 bool jbd_bms_ble_connect(const char *mac) {
     VESC_PRINT("JBD: Connect '%s'", mac);
     
-    if (!m_data_mutex) {
-        m_data_mutex = xSemaphoreCreateMutex();
-        if (!m_data_mutex) {
-            VESC_PRINT("JBD: Mutex fail");
-            return false;
-        }
-    }
+    if (!m_data_mutex) m_data_mutex = xSemaphoreCreateMutex();
     
     if (m_conn.connected) {
-        VESC_PRINT("JBD: Already connected");
+        VESC_PRINT("JBD: Already connected to BMS");
         return true;
     }
     
-    // If a connection is in progress, cancel it first
-    if (m_conn.connecting) {
-        VESC_PRINT("JBD: Cancelling previous...");
-        ble_gap_conn_cancel();
-        vTaskDelay(pdMS_TO_TICKS(500));
-        m_conn.connecting = false;
+    if (!ble_hs_is_enabled()) {
+        VESC_PRINT("JBD: BLE host not enabled!");
+        return false;
+    }
+    
+    // Check if VESC Tool is connected - if so, skip this attempt
+    extern bool comm_ble_is_connected(void);
+    if (comm_ble_is_connected()) {
+        VESC_PRINT("JBD: VESC Tool connected, skipping BMS connect");
+        return false;
     }
     
     memset(&m_conn, 0, sizeof(m_conn));
+    m_conn.conn_handle = 0xFFFF;
     memset(&m_rx, 0, sizeof(m_rx));
     
     if (!parse_mac(mac, &m_conn.target_addr)) {
@@ -416,20 +414,25 @@ bool jbd_bms_ble_connect(const char *mac) {
                m_conn.target_addr.val[3], m_conn.target_addr.val[2],
                m_conn.target_addr.val[1], m_conn.target_addr.val[0]);
     
-    // Try RANDOM first (most BMS use random static)
-    if (do_connect(BLE_ADDR_RANDOM)) return true;
+    VESC_PRINT("JBD: adv=%d", ble_gap_adv_active());
     
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    VESC_PRINT("JBD: Stopping adv...");
+    stop_all_gap_activity();
     
-    // Try PUBLIC
-    if (do_connect(BLE_ADDR_PUBLIC)) return true;
+    if (do_connect()) {
+        VESC_PRINT("JBD: BMS connected!");
+        return true;
+    }
     
-    VESC_PRINT("JBD: All attempts failed");
+    // Failed - restart advertising immediately
+    VESC_PRINT("JBD: Connect failed, restarting adv");
+    schedule_adv_restart();
+    
     return false;
 }
 
 void jbd_bms_ble_disconnect(void) {
-    if (m_conn.connected) {
+    if (m_conn.connected && m_conn.conn_handle != 0xFFFF) {
         ble_gap_terminate(m_conn.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     } else if (m_conn.connecting) {
         ble_gap_conn_cancel();
@@ -438,21 +441,11 @@ void jbd_bms_ble_disconnect(void) {
     m_conn.connecting = false;
 }
 
-bool jbd_bms_ble_is_connected(void) {
-    return m_conn.connected;
-}
+bool jbd_bms_ble_is_connected(void) { return m_conn.connected; }
 
 static bool send_cmd(const uint8_t *cmd, size_t len) {
-    if (!m_conn.connected || m_conn.tx_handle == 0) {
-        return false;
-    }
-    
-    int rc = ble_gattc_write_no_rsp_flat(m_conn.conn_handle, m_conn.tx_handle, cmd, len);
-    if (rc != 0) {
-        VESC_PRINT("JBD: Write fail: %d", rc);
-        return false;
-    }
-    return true;
+    if (!m_conn.connected || m_conn.tx_handle == 0) return false;
+    return ble_gattc_write_no_rsp_flat(m_conn.conn_handle, m_conn.tx_handle, cmd, len) == 0;
 }
 
 bool jbd_bms_ble_request_basic(void) { return send_cmd(CMD_BASIC, sizeof(CMD_BASIC)); }
@@ -585,5 +578,5 @@ void jbd_bms_ble_load_extensions(void) {
     lbm_add_extension("jbd-bms-get-nominal-cap", ext_nom_cap);
     lbm_add_extension("jbd-bms-update-vesc-bms", ext_update_vesc);
     
-    VESC_PRINT("JBD: Loaded (NimBLE v2)");
+    VESC_PRINT("JBD: Loaded (NimBLE v9)");
 }
