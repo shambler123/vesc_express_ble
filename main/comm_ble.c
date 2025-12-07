@@ -1,8 +1,10 @@
 /*
 	Copyright 2022 Benjamin Vedder	benjamin@vedder.se
-	NimBLE port for dual-role BLE support
+	NimBLE port for dual-role BLE support - v4
 
 	This file is part of the VESC firmware.
+	
+	Try using extended advertising or different adv params
 */
 
 #include "comm_ble.h"
@@ -59,7 +61,8 @@ static uint16_t tx_attr_handle = 0;
 static uint8_t own_addr_type;
 static PACKET_STATE_t *packet_state;
 static bool ble_initialized = false;
-static volatile bool want_advertising = true;  // Flag to indicate we want to advertise
+static volatile bool want_advertising = true;
+static bool adv_configured = false;
 
 static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg);
@@ -118,9 +121,9 @@ static int gatt_svr_chr_access(uint16_t conn_h, uint16_t attr_handle,
 static int gap_event_handler(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
-            ESP_LOGI(TAG, "Connection %s; status=%d",
+            ESP_LOGI(TAG, "Connection %s; status=%d handle=%d",
                      event->connect.status == 0 ? "established" : "failed",
-                     event->connect.status);
+                     event->connect.status, event->connect.conn_handle);
             if (event->connect.status == 0) {
                 conn_handle = event->connect.conn_handle;
                 is_connected = true;
@@ -134,7 +137,9 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             break;
 
         case BLE_GAP_EVENT_DISCONNECT:
-            ESP_LOGI(TAG, "Disconnected; reason=%d", event->disconnect.reason);
+            ESP_LOGI(TAG, "Disconnected; reason=%d handle=%d", 
+                     event->disconnect.reason,
+                     event->disconnect.conn.conn_handle);
             is_connected = false;
             conn_handle = 0;
             LED_BLUE_OFF();
@@ -143,7 +148,9 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
             ESP_LOGI(TAG, "Advertise complete");
-            ble_advertise();
+            if (!is_connected) {
+                ble_advertise();
+            }
             break;
 
         case BLE_GAP_EVENT_MTU:
@@ -166,19 +173,10 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
     return 0;
 }
 
-static void ble_advertise(void) {
-    struct ble_gap_adv_params adv_params;
+static void configure_adv_data(void) {
     struct ble_hs_adv_fields fields;
     struct ble_hs_adv_fields rsp_fields;
     int rc;
-
-    commands_printf_lisp("COMM: ble_advertise() called");
-
-    // If already advertising, nothing to do
-    if (ble_gap_adv_active()) {
-        commands_printf_lisp("COMM: Already advertising");
-        return;
-    }
 
     memset(&fields, 0, sizeof(fields));
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -187,7 +185,7 @@ static void ble_advertise(void) {
     fields.name_is_complete = 1;
 
     rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0 && rc != BLE_HS_EALREADY) {
+    if (rc != 0) {
         commands_printf_lisp("COMM: adv_set_fields err=%d", rc);
         return;
     }
@@ -198,17 +196,38 @@ static void ble_advertise(void) {
     rsp_fields.uuids128_is_complete = 1;
 
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
-    if (rc != 0 && rc != BLE_HS_EALREADY) {
+    if (rc != 0) {
         commands_printf_lisp("COMM: adv_rsp_set_fields err=%d", rc);
+    }
+    
+    adv_configured = true;
+}
+
+static void ble_advertise(void) {
+    struct ble_gap_adv_params adv_params;
+    int rc;
+
+    commands_printf_lisp("COMM: ble_advertise()");
+
+    if (ble_gap_adv_active()) {
+        commands_printf_lisp("COMM: Already advertising");
+        return;
+    }
+    
+    // Configure adv data only once
+    if (!adv_configured) {
+        configure_adv_data();
     }
 
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    adv_params.itvl_min = 0x20;
-    adv_params.itvl_max = 0x40;
+    adv_params.itvl_min = 0x20;  // 20ms
+    adv_params.itvl_max = 0x40;  // 40ms
+    adv_params.channel_map = 0;  // Use all channels
+    adv_params.filter_policy = BLE_HCI_ADV_FILT_NONE;
+    adv_params.high_duty_cycle = 0;
 
-    // Try starting advertising - if busy, controller might be finishing something
     rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_handler, NULL);
     if (rc != 0) {
@@ -239,6 +258,7 @@ static void ble_on_sync(void) {
 
 static void ble_on_reset(int reason) {
     ESP_LOGE(TAG, "BLE reset; reason=%d", reason);
+    adv_configured = false;  // Need to reconfigure after reset
 }
 
 static void nimble_host_task(void *param) {
@@ -341,16 +361,14 @@ bool comm_ble_is_initialized(void) {
 
 // Public function to restart advertising
 void comm_ble_restart_advertising(void) {
-    want_advertising = true;  // Always set the flag
+    want_advertising = true;
     commands_printf_lisp("COMM: restart_adv init=%d adv=%d srvr_conn=%d", 
                          ble_initialized, ble_gap_adv_active(), is_connected);
     if (ble_initialized && !ble_gap_adv_active()) {
-        commands_printf_lisp("COMM: Calling ble_advertise()");
         ble_advertise();
     }
 }
 
-// Call this periodically to check if advertising needs to be started
 void comm_ble_check_advertising(void) {
     if (want_advertising && ble_initialized && !ble_gap_adv_active() && !is_connected) {
         ble_advertise();
