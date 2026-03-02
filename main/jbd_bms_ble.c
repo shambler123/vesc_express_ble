@@ -475,7 +475,7 @@ void jbd_bms_ble_update_vesc_bms(void) {
     bms->i_in = m_bms_data.current;
     bms->i_in_ic = m_bms_data.current;
     bms->ah_cnt = m_bms_data.remain_capacity;
-    bms->wh_cnt = m_bms_data.remain_capacity * m_bms_data.voltage;
+    bms->wh_cnt = m_bms_data.remain_capacity * m_bms_data.cell_count * 3.6f;
     bms->cell_num = m_bms_data.cell_count;
     bms->soc = m_bms_data.soc / 100.0f;
     bms->soh = 1.0f;
