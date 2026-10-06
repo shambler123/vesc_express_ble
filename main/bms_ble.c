@@ -51,23 +51,35 @@
 #define RX_BUF_SIZE				320
 #define CMD_TIMEOUT_MS			1500
 #define POLL_INTERVAL_MS		1000
-#define TARGET_SCAN_MS			6000	// Scan this long for the target before trying a direct connect
-#define CONNECT_TIMEOUT_MS		40000	// Bluedroid direct connect timeout is ~30 s
-#define RECONNECT_DELAY_MS		3000
+#define TARGET_SCAN_MS			8000	// Scan this long for the target before trying a direct connect
+#define CONNECT_TIMEOUT_MS		20000	// Bluedroid connect timeout is CONFIG_BT_BLE_ESTAB_LINK_CONN_TOUT (8 s) + discovery
+#define RECONNECT_DELAY_MS		3000	// First retry, doubles on every failure up to RECONNECT_DELAY_MAX_MS
+#define RECONNECT_DELAY_MAX_MS	60000
+#define RECONNECT_DELAY_PHONE_MS 10000	// Minimum retry delay while VESC Tool is connected
 #define MAX_POLL_FAILS			5
 #define TASK_PERIOD_MS			50
 
-// Scan policy (jeremym8884): listen 60 % of the time when nothing is
-// connected, only 10 % when the phone or the BMS is already attached.
+// Scan policy. User scans (device list) listen 40 % of the time when nothing
+// is connected and 10 % when the phone or the BMS is attached. The internal
+// scan used to find the BMS for a (re)connect is passive and only listens
+// 5 % of the time. Bluedroid also uses the last scan parameters while it
+// initiates a connection, so this keeps the radio free for WiFi and the
+// VESC Tool link.
 #define SCAN_INTERVAL_FREE		0x50	// 50 ms
-#define SCAN_WINDOW_FREE		0x30	// 30 ms (60 %)
+#define SCAN_WINDOW_FREE		0x20	// 20 ms (40 %)
 #define SCAN_INTERVAL_BUSY		0xA0	// 100 ms
 #define SCAN_WINDOW_BUSY		0x10	// 10 ms (10 %)
+#define SCAN_INTERVAL_LOW		0x140	// 200 ms
+#define SCAN_WINDOW_LOW			0x10	// 10 ms (5 %)
 
-// Connection parameters for the BMS link, leaves most air-time for the phone
-#define BMS_CONN_INT_MIN		24		// 30 ms
-#define BMS_CONN_INT_MAX		48		// 60 ms
-#define BMS_CONN_TIMEOUT		500		// 5 s
+// Connection parameters for the BMS link. Discovery runs at 100 to 150 ms,
+// afterwards the link is slowed down to 200 to 300 ms since the BMS is only
+// polled once per second. This leaves most of the air-time to the phone.
+#define BMS_CONN_INT_DISC_MIN	80		// 100 ms
+#define BMS_CONN_INT_DISC_MAX	120		// 150 ms
+#define BMS_CONN_INT_MIN		160		// 200 ms
+#define BMS_CONN_INT_MAX		240		// 300 ms
+#define BMS_CONN_TIMEOUT		600		// 6 s
 
 #define UUID_JBD_SVC			0xFF00
 #define UUID_JBD_RX				0xFF01
@@ -108,9 +120,11 @@ static volatile bms_ble_state_t m_state = BMS_BLE_STATE_DISABLED;
 static bool m_target_set = false;
 static uint8_t m_target_addr[6];
 static uint8_t m_target_addr_type = BLE_ADDR_TYPE_PUBLIC;
+static volatile bool m_target_addr_known = false;	// Address type confirmed by a scan or a connection
 static bms_ble_type_t m_target_type = BMS_BLE_TYPE_AUTO;
 static volatile bool m_auto_reconnect = false;
 static uint32_t m_last_attempt = 0;
+static uint32_t m_reconnect_delay = RECONNECT_DELAY_MS;
 static uint32_t m_connect_start = 0;
 static volatile bool m_open_requested = false;
 static volatile bool m_target_seen = false;
@@ -131,6 +145,7 @@ static struct {
 static volatile bool m_scanning = false;
 static volatile bool m_scan_user = false;
 static volatile bool m_scan_params_pending = false;
+static volatile bool m_open_after_params = false;
 static volatile bool m_open_after_scan_stop = false;
 static uint32_t m_scan_duration_s = 0;
 static bms_ble_scan_entry_t m_scan[BMS_BLE_SCAN_MAX];
@@ -212,14 +227,14 @@ static bool any_link_busy(void) {
 // Scanning
 // ---------------------------------------------------------------------------
 
-static void scan_apply_params(void) {
+static void scan_apply_params(bool user) {
 	bool busy = any_link_busy();
 	esp_ble_scan_params_t p = {
-		.scan_type = BLE_SCAN_TYPE_ACTIVE,
+		.scan_type = user ? BLE_SCAN_TYPE_ACTIVE : BLE_SCAN_TYPE_PASSIVE,
 		.own_addr_type = BLE_ADDR_TYPE_PUBLIC,
 		.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
-		.scan_interval = busy ? SCAN_INTERVAL_BUSY : SCAN_INTERVAL_FREE,
-		.scan_window = busy ? SCAN_WINDOW_BUSY : SCAN_WINDOW_FREE,
+		.scan_interval = !user ? SCAN_INTERVAL_LOW : (busy ? SCAN_INTERVAL_BUSY : SCAN_INTERVAL_FREE),
+		.scan_window = !user ? SCAN_WINDOW_LOW : (busy ? SCAN_WINDOW_BUSY : SCAN_WINDOW_FREE),
 		.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE,
 	};
 	esp_ble_gap_set_scan_params(&p);
@@ -240,8 +255,24 @@ static bool scan_start_internal(uint32_t seconds, bool user) {
 
 	m_scan_duration_s = seconds;
 	m_scan_params_pending = true;
-	scan_apply_params();
+	scan_apply_params(user);
 	return true;
+}
+
+static void schedule_retry(void) {
+	m_last_attempt = now_ms();
+	m_reconnect_delay *= 2;
+	if (m_reconnect_delay > RECONNECT_DELAY_MAX_MS) {
+		m_reconnect_delay = RECONNECT_DELAY_MAX_MS;
+	}
+}
+
+static uint32_t retry_delay(void) {
+	uint32_t d = m_reconnect_delay;
+	if (comm_ble_is_connected() && d < RECONNECT_DELAY_PHONE_MS) {
+		d = RECONNECT_DELAY_PHONE_MS;
+	}
+	return d;
 }
 
 static bms_ble_type_t type_from_adv(uint8_t *adv, uint16_t len, const uint8_t *name, uint8_t name_len) {
@@ -299,11 +330,15 @@ static void scan_result(struct ble_scan_result_evt_param *r) {
 
 	bms_ble_type_t type = type_from_adv(r->ble_adv, adv_len, name, name_len);
 
+	if (m_target_set && memcmp(r->bda, m_target_addr, 6) == 0) {
+		m_target_addr_type = r->ble_addr_type;
+		m_target_addr_known = true;
+	}
+
 	// Connect flow: looking for the configured target
 	if (m_state == BMS_BLE_STATE_CONNECTING && !m_target_seen && !m_open_requested &&
 			memcmp(r->bda, m_target_addr, 6) == 0) {
 		m_target_seen = true;
-		m_target_addr_type = r->ble_addr_type;
 		DBG("Target found (rssi %d, addr type %d)", r->rssi, r->ble_addr_type);
 		m_open_after_scan_stop = true;
 		esp_ble_gap_stop_scanning();
@@ -375,12 +410,25 @@ static void do_open(void) {
 	m_open_requested = true;
 	DBG("Opening %02X:%02X:%02X:%02X:%02X:%02X type %s", m_target_addr[0], m_target_addr[1],
 			m_target_addr[2], m_target_addr[3], m_target_addr[4], m_target_addr[5], type_name(m_target_type));
+	esp_ble_gap_set_prefer_conn_params(m_target_addr, BMS_CONN_INT_DISC_MIN, BMS_CONN_INT_DISC_MAX, 0, BMS_CONN_TIMEOUT);
 	esp_err_t r = esp_ble_gattc_open(m_gattc_if, m_target_addr, m_target_addr_type, true);
 	if (r != ESP_OK) {
 		DBG("gattc_open failed: %d", r);
 		m_open_requested = false;
 		m_state = BMS_BLE_STATE_IDLE;
-		m_last_attempt = now_ms();
+		schedule_retry();
+	}
+}
+
+// Direct connect without a scan: set the low duty scan parameters first, the
+// controller uses them while initiating.
+static void request_open(void) {
+	if (m_scanning) {
+		m_open_after_scan_stop = true;
+		esp_ble_gap_stop_scanning();
+	} else {
+		m_open_after_params = true;
+		scan_apply_params(false);
 	}
 }
 
@@ -392,6 +440,10 @@ void bms_ble_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 			if (esp_ble_gap_start_scanning(m_scan_duration_s) != ESP_OK) {
 				m_scan_user = false;
 			}
+		}
+		if (m_open_after_params) {
+			m_open_after_params = false;
+			do_open();
 		}
 		break;
 
@@ -501,12 +553,13 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 			m_conn.conn_id = param->open.conn_id;
 			memcpy(m_conn.bda, param->open.remote_bda, 6);
 			DBG("Open ok, conn_id %d", m_conn.conn_id);
+			m_target_addr_known = true;
 			esp_ble_gattc_send_mtu_req(gattc_if, m_conn.conn_id);
 			esp_ble_gattc_search_service(gattc_if, m_conn.conn_id, NULL);
 		} else {
 			DBG("Open failed: %d", param->open.status);
 			m_state = BMS_BLE_STATE_IDLE;
-			m_last_attempt = now_ms();
+			schedule_retry();
 		}
 		break;
 
@@ -608,7 +661,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 		if (m_conn.open && param->disconnect.conn_id == m_conn.conn_id) {
 			DBG("Disconnected, reason 0x%X", param->disconnect.reason);
 			reset_conn();
-			m_last_attempt = now_ms();
+			schedule_retry();
 			if (m_state == BMS_BLE_STATE_CONNECTED || m_state == BMS_BLE_STATE_CONNECTING) {
 				m_state = BMS_BLE_STATE_IDLE;
 			}
@@ -622,7 +675,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 	case ESP_GATTC_CLOSE_EVT:
 		if (m_conn.open && param->close.conn_id == m_conn.conn_id) {
 			reset_conn();
-			m_last_attempt = now_ms();
+			schedule_retry();
 			if (m_state == BMS_BLE_STATE_CONNECTED || m_state == BMS_BLE_STATE_CONNECTING) {
 				m_state = BMS_BLE_STATE_IDLE;
 			}
@@ -1316,8 +1369,14 @@ static void begin_connect(void) {
 	m_state = BMS_BLE_STATE_CONNECTING;
 	memset(&m_work, 0, sizeof(m_work));
 	m_work.soh = 1.0f;
-	DBG("Connecting, scanning for target");
-	scan_start_internal(TARGET_SCAN_MS / 1000 + 1, false);
+	if (m_target_addr_known) {
+		m_target_seen = true;
+		DBG("Connecting directly (retry delay %lu ms)", (unsigned long)m_reconnect_delay);
+		request_open();
+	} else {
+		DBG("Connecting, scanning for target");
+		scan_start_internal(TARGET_SCAN_MS / 1000 + 1, false);
+	}
 }
 
 static void bms_ble_task(void *arg) {
@@ -1334,7 +1393,7 @@ static void bms_ble_task(void *arg) {
 
 		case BMS_BLE_STATE_IDLE:
 			if (m_target_set && m_auto_reconnect && !m_conn.open && !m_open_requested &&
-					age_ms(m_last_attempt) > RECONNECT_DELAY_MS) {
+					age_ms(m_last_attempt) > retry_delay()) {
 				begin_connect();
 			}
 			break;
@@ -1354,19 +1413,14 @@ static void bms_ble_task(void *arg) {
 				// Not seen while scanning, try a direct connection
 				m_target_seen = true;
 				DBG("Target not seen, trying direct connect");
-				if (m_scanning) {
-					m_open_after_scan_stop = true;
-					esp_ble_gap_stop_scanning();
-				} else {
-					do_open();
-				}
+				request_open();
 			} else if (age_ms(m_connect_start) > CONNECT_TIMEOUT_MS) {
 				DBG("Connect timeout");
 				if (m_conn.open) {
 					esp_ble_gattc_close(m_gattc_if, m_conn.conn_id);
 				}
 				m_open_requested = false;
-				m_last_attempt = now_ms();
+				schedule_retry();
 				m_state = BMS_BLE_STATE_IDLE;
 			}
 			break;
@@ -1387,13 +1441,14 @@ static void bms_ble_task(void *arg) {
 				last_poll = now_ms();
 				if (proto_poll()) {
 					poll_fails = 0;
+					m_reconnect_delay = RECONNECT_DELAY_MS;
 				} else {
 					poll_fails++;
 					DBG("Poll failed (%d)", poll_fails);
 					if (poll_fails >= MAX_POLL_FAILS) {
 						DBG("Too many failures, reconnecting");
 						esp_ble_gattc_close(m_gattc_if, m_conn.conn_id);
-						m_last_attempt = now_ms();
+						schedule_retry();
 						m_state = BMS_BLE_STATE_IDLE;
 					}
 				}
@@ -1472,10 +1527,14 @@ bool bms_ble_connect(const uint8_t addr[6], bms_ble_type_t type) {
 	bool same = m_target_set && memcmp(addr, m_target_addr, 6) == 0 && type == m_target_type;
 
 	memcpy(m_target_addr, addr, 6);
-	m_target_addr_type = BLE_ADDR_TYPE_PUBLIC;
+	if (!same) {
+		m_target_addr_type = BLE_ADDR_TYPE_PUBLIC;
+		m_target_addr_known = false;
+	}
 	m_target_type = type;
 	m_target_set = true;
 	m_auto_reconnect = true;
+	m_reconnect_delay = RECONNECT_DELAY_MS;
 
 	if (!same && m_conn.open) {
 		esp_ble_gattc_close(m_gattc_if, m_conn.conn_id);
