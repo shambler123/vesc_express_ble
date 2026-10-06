@@ -38,7 +38,7 @@
 #include <stdbool.h>
 #include "sdkconfig.h"
 
-#define BMS_BLE_MAX_CELLS		48
+#define BMS_BLE_MAX_CELLS		32
 #define BMS_BLE_MAX_TEMPS		8
 #define BMS_BLE_SCAN_MAX		16
 #define BMS_BLE_NAME_LEN		24

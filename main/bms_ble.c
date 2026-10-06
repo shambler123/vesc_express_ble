@@ -113,8 +113,8 @@ static const uint8_t UUID_NUS_RX[16]  = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA
 #define DALY_VARIANT_X81		2
 #define DALY_VARIANT_A5			3
 
-#define DBG_LINES				6
-#define DBG_LINE_LEN			96
+#define DBG_LINES				4
+#define DBG_LINE_LEN			80
 #define DBG(fmt, ...) do { if (m_debug) { dbg_push(fmt, ##__VA_ARGS__); } } while (0)
 
 // Progress marker that survives a reset (RTC memory), used to find the
@@ -295,7 +295,10 @@ static void scan_apply_params(scan_mode_t mode) {
 		.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
 		.scan_interval = interval,
 		.scan_window = window,
-		.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE,
+		// The device list wants fresh RSSI values, the internal scan only
+		// needs to see the target once. Filtering in the controller keeps
+		// the host task and its queue free of repeated advertisements.
+		.scan_duplicate = mode == SCAN_MODE_USER ? BLE_SCAN_DUPLICATE_DISABLE : BLE_SCAN_DUPLICATE_ENABLE,
 	};
 	esp_ble_gap_set_scan_params(&p);
 }
@@ -626,11 +629,10 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 			DBG("Open ok, conn_id %d", m_conn.conn_id);
 			STAGE(5);
 			m_target_addr_known = true;
-			// One GATT procedure at a time: the service search starts in
-			// ESP_GATTC_CFG_MTU_EVT, like the esp-idf gatt_client example.
-			if (esp_ble_gattc_send_mtu_req(gattc_if, m_conn.conn_id) != ESP_OK) {
-				esp_ble_gattc_search_service(gattc_if, m_conn.conn_id, NULL);
-			}
+			// No MTU exchange on the BMS link: the replies are small and
+			// arrive chunked anyway, and every MTU event is one more
+			// Bluedroid server callback with an allocation in the host task.
+			esp_ble_gattc_search_service(gattc_if, m_conn.conn_id, NULL);
 		} else {
 			DBG("Open failed: %d", param->open.status);
 			m_state = BMS_BLE_STATE_IDLE;
@@ -1582,7 +1584,7 @@ void bms_ble_init(void) {
 	esp_ble_gattc_register_callback(gattc_event_handler);
 	esp_ble_gattc_app_register(BMS_GATTC_APP_ID);
 
-	xTaskCreatePinnedToCore(bms_ble_task, "bms_ble", 6144, NULL, 6, &m_task, tskNO_AFFINITY);
+	xTaskCreatePinnedToCore(bms_ble_task, "bms_ble", 4096, NULL, 6, &m_task, tskNO_AFFINITY);
 }
 
 bool bms_ble_available(void) {
