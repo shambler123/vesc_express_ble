@@ -1884,14 +1884,11 @@ static void begin_connect(void) {
 	memset(&m_work, 0, sizeof(m_work));
 	m_work.soh = 1.0f;
 	m_ffe0_probed = false;
-	if (m_target_addr_known) {
-		m_target_seen = true;
-		DBG("Connecting directly (retry delay %lu ms)", (unsigned long)m_reconnect_delay);
-		request_open();
-	} else {
-		DBG("Connecting, scanning for target");
-		scan_start_internal(TARGET_SCAN_MS / 1000 + 1, false);
-	}
+	// Always look for the BMS first and only initiate when it was just seen
+	// advertising. A direct connect to a sleeping or absent BMS runs into the
+	// Bluedroid cancel path, which has proven fragile on the C3.
+	DBG("Connecting, scanning for target (retry delay %lu ms)", (unsigned long)m_reconnect_delay);
+	scan_start_internal(TARGET_SCAN_MS / 1000 + 1, false);
 }
 
 static void bms_ble_task(void *arg) {
@@ -1928,11 +1925,15 @@ static void bms_ble_task(void *arg) {
 				m_work.err_count = m_data.err_count;
 				vTaskDelay(pdMS_TO_TICKS(300));
 			} else if (!m_target_seen && !m_open_requested && !m_conn.open &&
-					age_ms(m_connect_start) > TARGET_SCAN_MS) {
-				// Not seen while scanning, try a direct connection
-				m_target_seen = true;
-				DBG("Target not seen, trying direct connect");
-				request_open();
+					age_ms(m_connect_start) > TARGET_SCAN_MS + 1500) {
+				// Not seen while scanning: the BMS is off, asleep or out of
+				// range. Wait for the next round instead of a blind connect.
+				DBG("Target not seen, retrying later");
+				if (m_scanning && !m_scan_user) {
+					esp_ble_gap_stop_scanning();
+				}
+				schedule_retry();
+				m_state = BMS_BLE_STATE_IDLE;
 			} else if (age_ms(m_connect_start) > CONNECT_TIMEOUT_MS) {
 				DBG("Connect timeout");
 				if (m_conn.open) {
