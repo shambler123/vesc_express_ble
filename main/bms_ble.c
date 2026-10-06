@@ -79,6 +79,16 @@
 #define UUID_LIPOWER_RXTX		0xFFE1
 #define UUID_LIPOWER_ADV		0xAF30
 
+// Nordic UART service as used by the LiTech BMS (128 bit, little endian order)
+static const uint8_t UUID_NUS_SVC[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E};
+static const uint8_t UUID_NUS_TX[16]  = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x02, 0x00, 0x40, 0x6E}; // we write here
+static const uint8_t UUID_NUS_RX[16]  = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x03, 0x00, 0x40, 0x6E}; // notifications
+
+#define LITECH_SLAVE_ID			0x01
+#define LITECH_LIVE_ADDR		0xD000
+#define LITECH_LIVE_COUNT		0x3B
+#define LITECH_CELL_UNUSED		0xEE49
+
 #define DALY_VARIANT_D2			1
 #define DALY_VARIANT_X81		2
 #define DALY_VARIANT_A5			3
@@ -175,6 +185,7 @@ static const char *type_name(bms_ble_type_t t) {
 	case BMS_BLE_TYPE_JBD: return "jbd";
 	case BMS_BLE_TYPE_DALY: return "daly";
 	case BMS_BLE_TYPE_LIPOWER: return "lipower";
+	case BMS_BLE_TYPE_LITECH: return "litech";
 	default: return "unknown";
 	}
 }
@@ -233,7 +244,29 @@ static bool scan_start_internal(uint32_t seconds, bool user) {
 	return true;
 }
 
-static bms_ble_type_t type_from_adv(uint8_t *adv, uint16_t len) {
+static bms_ble_type_t type_from_adv(uint8_t *adv, uint16_t len, const uint8_t *name, uint8_t name_len) {
+	if (name && name_len >= 7 && memcmp(name, "BT-BMS-", 7) == 0) {
+		return BMS_BLE_TYPE_LITECH;
+	}
+	if (name && name_len >= 3 && memcmp(name, "DL-", 3) == 0) {
+		return BMS_BLE_TYPE_DALY;
+	}
+	if (name && name_len >= 4 && memcmp(name, "JBD-", 4) == 0) {
+		return BMS_BLE_TYPE_JBD;
+	}
+
+	// Daly dongles often advertise no service UUID, only a manufacturer id
+	{
+		uint8_t l = 0;
+		uint8_t *m = esp_ble_resolve_adv_data_by_type(adv, len, ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE, &l);
+		if (m && l >= 2) {
+			uint16_t id = m[0] | (m[1] << 8);
+			if (id == 0x102 || id == 0x104 || id == 0x302 || id == 0x303 || id == 0x402) {
+				return BMS_BLE_TYPE_DALY;
+			}
+		}
+	}
+
 	const uint8_t types[] = {ESP_BLE_AD_TYPE_16SRV_CMPL, ESP_BLE_AD_TYPE_16SRV_PART};
 	for (int t = 0; t < 2; t++) {
 		uint8_t l = 0;
@@ -257,13 +290,14 @@ static bms_ble_type_t type_from_adv(uint8_t *adv, uint16_t len) {
 
 static void scan_result(struct ble_scan_result_evt_param *r) {
 	uint16_t adv_len = r->adv_data_len + r->scan_rsp_len;
-	bms_ble_type_t type = type_from_adv(r->ble_adv, adv_len);
 
 	uint8_t name_len = 0;
 	uint8_t *name = esp_ble_resolve_adv_data_by_type(r->ble_adv, adv_len, ESP_BLE_AD_TYPE_NAME_CMPL, &name_len);
 	if (!name) {
 		name = esp_ble_resolve_adv_data_by_type(r->ble_adv, adv_len, ESP_BLE_AD_TYPE_NAME_SHORT, &name_len);
 	}
+
+	bms_ble_type_t type = type_from_adv(r->ble_adv, adv_len, name, name_len);
 
 	// Connect flow: looking for the configured target
 	if (m_state == BMS_BLE_STATE_CONNECTING && !m_target_seen && !m_open_requested &&
@@ -403,31 +437,37 @@ void bms_ble_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 static void proto_on_rx(const uint8_t *data, uint16_t len);
 
 static void discover_chars(void) {
-	uint16_t rx_uuid = 0, tx_uuid = 0;
+	esp_bt_uuid_t rx = {.len = ESP_UUID_LEN_16};
+	esp_bt_uuid_t tx = {.len = ESP_UUID_LEN_16};
+	bool same = false;
 	switch (m_conn.type) {
-	case BMS_BLE_TYPE_JBD: rx_uuid = UUID_JBD_RX; tx_uuid = UUID_JBD_TX; break;
-	case BMS_BLE_TYPE_DALY: rx_uuid = UUID_DALY_RX; tx_uuid = UUID_DALY_TX; break;
-	case BMS_BLE_TYPE_LIPOWER: rx_uuid = UUID_LIPOWER_RXTX; tx_uuid = UUID_LIPOWER_RXTX; break;
+	case BMS_BLE_TYPE_JBD: rx.uuid.uuid16 = UUID_JBD_RX; tx.uuid.uuid16 = UUID_JBD_TX; break;
+	case BMS_BLE_TYPE_DALY: rx.uuid.uuid16 = UUID_DALY_RX; tx.uuid.uuid16 = UUID_DALY_TX; break;
+	case BMS_BLE_TYPE_LIPOWER: rx.uuid.uuid16 = UUID_LIPOWER_RXTX; tx.uuid.uuid16 = UUID_LIPOWER_RXTX; same = true; break;
+	case BMS_BLE_TYPE_LITECH:
+		rx.len = ESP_UUID_LEN_128;
+		tx.len = ESP_UUID_LEN_128;
+		memcpy(rx.uuid.uuid128, UUID_NUS_RX, 16);
+		memcpy(tx.uuid.uuid128, UUID_NUS_TX, 16);
+		break;
 	default: break;
 	}
 
 	esp_gattc_char_elem_t elem;
 	uint16_t count = 1;
-	esp_bt_uuid_t u = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = rx_uuid};
 	if (esp_ble_gattc_get_char_by_uuid(m_gattc_if, m_conn.conn_id, m_conn.svc_start,
-			m_conn.svc_end, u, &elem, &count) == ESP_GATT_OK && count > 0) {
+			m_conn.svc_end, rx, &elem, &count) == ESP_GATT_OK && count > 0) {
 		m_conn.rx_handle = elem.char_handle;
-		if (rx_uuid == tx_uuid) {
+		if (same) {
 			m_conn.tx_handle = elem.char_handle;
 			m_conn.tx_write_nr = (elem.properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) != 0;
 		}
 	}
 
-	if (rx_uuid != tx_uuid) {
+	if (!same) {
 		count = 1;
-		u.uuid.uuid16 = tx_uuid;
 		if (esp_ble_gattc_get_char_by_uuid(m_gattc_if, m_conn.conn_id, m_conn.svc_start,
-				m_conn.svc_end, u, &elem, &count) == ESP_GATT_OK && count > 0) {
+				m_conn.svc_end, tx, &elem, &count) == ESP_GATT_OK && count > 0) {
 			m_conn.tx_handle = elem.char_handle;
 			m_conn.tx_write_nr = (elem.properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) != 0;
 		}
@@ -474,15 +514,22 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 		if (param->search_res.conn_id != m_conn.conn_id) {
 			break;
 		}
-		if (param->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16) {
-			uint16_t uuid = param->search_res.srvc_id.uuid.uuid.uuid16;
+		{
 			bms_ble_type_t t = BMS_BLE_TYPE_UNKNOWN;
-			if (uuid == UUID_JBD_SVC) {
-				t = BMS_BLE_TYPE_JBD;
-			} else if (uuid == UUID_DALY_SVC) {
-				t = BMS_BLE_TYPE_DALY;
-			} else if (uuid == UUID_LIPOWER_SVC) {
-				t = BMS_BLE_TYPE_LIPOWER;
+			uint16_t uuid = 0;
+			if (param->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16) {
+				uuid = param->search_res.srvc_id.uuid.uuid.uuid16;
+				if (uuid == UUID_JBD_SVC) {
+					t = BMS_BLE_TYPE_JBD;
+				} else if (uuid == UUID_DALY_SVC) {
+					t = BMS_BLE_TYPE_DALY;
+				} else if (uuid == UUID_LIPOWER_SVC) {
+					t = BMS_BLE_TYPE_LIPOWER;
+				}
+			} else if (param->search_res.srvc_id.uuid.len == ESP_UUID_LEN_128 &&
+					memcmp(param->search_res.srvc_id.uuid.uuid.uuid128, UUID_NUS_SVC, 16) == 0) {
+				t = BMS_BLE_TYPE_LITECH;
+				uuid = 0x6E40;
 			}
 
 			if (t != BMS_BLE_TYPE_UNKNOWN && (m_target_type == BMS_BLE_TYPE_AUTO || m_target_type == t) &&
@@ -1090,6 +1137,57 @@ static bool lipower_poll(void) {
 }
 
 // ---------------------------------------------------------------------------
+// LiTech protocol (Modbus RTU over Nordic UART, register map reverse
+// engineered by shambler: live data block 0xD000..0xD03A)
+// ---------------------------------------------------------------------------
+
+static bool litech_poll(void) {
+	uint8_t cmd[8];
+	modbus_cmd(cmd, LITECH_SLAVE_ID, LITECH_LIVE_ADDR, LITECH_LIVE_COUNT);
+	if (!transact(cmd, 8, LITECH_SLAVE_ID, 0)) {
+		return false;
+	}
+	if (m_rx_buf[2] != LITECH_LIVE_COUNT * 2) {
+		return false;
+	}
+
+	const uint8_t *d = &m_rx_buf[3];
+#define LREG(a) be16(&d[((a) - LITECH_LIVE_ADDR) * 2])
+
+	int nc = 0;
+	for (int i = 0; i < 32; i++) {
+		uint16_t v = be16(&d[i * 2]);
+		if (v == LITECH_CELL_UNUSED || v == 0) {
+			continue;
+		}
+		if (nc < BMS_BLE_MAX_CELLS) {
+			m_work.cells[nc++] = v / 1000.0f;
+		}
+	}
+	m_work.cell_count = nc;
+
+	m_work.voltage = LREG(0xD025) / 100.0f;
+	// TODO: not verified against a load, 0xD032 is the best candidate (0.01 A, signed)
+	m_work.current = (int16_t)LREG(0xD032) / 100.0f;
+	m_work.temp_count = 4;
+	for (int i = 0; i < 4; i++) {
+		m_work.temps[i] = LREG(0xD026 + i) / 10.0f - 40.0f;
+	}
+	m_work.temp_mos_valid = false;
+	m_work.soc = LREG(0xD034) / 100.0f;
+	m_work.soh = LREG(0xD035) / 100.0f;
+	m_work.ah_remain = LREG(0xD036) / 10.0f;
+	m_work.ah_nominal = LREG(0xD038) / 10.0f;
+	m_work.cycles = LREG(0xD03A);
+	m_work.chg_fet = true;
+	m_work.dis_fet = true;
+	m_work.balance_bits = 0;
+	m_work.problem = 0;
+#undef LREG
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Protocol dispatch
 // ---------------------------------------------------------------------------
 
@@ -1116,6 +1214,7 @@ static void proto_on_rx(const uint8_t *data, uint16_t len) {
 		}
 		break;
 	case BMS_BLE_TYPE_LIPOWER:
+	case BMS_BLE_TYPE_LITECH:
 		modbus_on_rx();
 		break;
 	default:
@@ -1130,6 +1229,7 @@ static bool proto_poll(void) {
 	case BMS_BLE_TYPE_JBD: ok = jbd_poll(); break;
 	case BMS_BLE_TYPE_DALY: ok = daly_poll(); break;
 	case BMS_BLE_TYPE_LIPOWER: ok = lipower_poll(); break;
+	case BMS_BLE_TYPE_LITECH: ok = litech_poll(); break;
 	default: break;
 	}
 
@@ -1197,7 +1297,7 @@ static void update_vesc_bms(void) {
 		v->temp_ic = d->temp_mos;
 	}
 	v->soc = d->soc;
-	v->soh = 1.0f;
+	v->soh = d->soh;
 	v->is_charging = d->current > 0.05f;
 	v->is_balancing = d->balance_bits != 0;
 	v->is_charge_allowed = d->chg_fet;
@@ -1215,6 +1315,7 @@ static void begin_connect(void) {
 	m_open_after_scan_stop = false;
 	m_state = BMS_BLE_STATE_CONNECTING;
 	memset(&m_work, 0, sizeof(m_work));
+	m_work.soh = 1.0f;
 	DBG("Connecting, scanning for target");
 	scan_start_internal(TARGET_SCAN_MS / 1000 + 1, false);
 }
@@ -1428,7 +1529,7 @@ void bms_ble_set_debug(bool enabled) {
 // LispBM extensions
 // ---------------------------------------------------------------------------
 
-static lbm_uint sym_auto, sym_jbd, sym_daly, sym_lipower, sym_unknown;
+static lbm_uint sym_auto, sym_jbd, sym_daly, sym_lipower, sym_litech, sym_unknown;
 static lbm_uint sym_disabled, sym_idle, sym_connecting, sym_connected;
 
 typedef struct {
@@ -1441,6 +1542,7 @@ static key_t_ m_keys[] = {
 	{"cycles", 0}, {"cell-count", 0}, {"temp-count", 0}, {"cell-min", 0}, {"cell-max", 0},
 	{"temp-mos", 0}, {"chg-fet", 0}, {"dis-fet", 0}, {"balance", 0}, {"problem", 0},
 	{"msg-count", 0}, {"err-count", 0}, {"age", 0}, {"runtime", 0}, {"variant", 0},
+	{"soh", 0},
 };
 
 static lbm_value make_str(const char *s) {
@@ -1461,6 +1563,7 @@ static lbm_value type_sym(bms_ble_type_t t) {
 	case BMS_BLE_TYPE_JBD: return lbm_enc_sym(sym_jbd);
 	case BMS_BLE_TYPE_DALY: return lbm_enc_sym(sym_daly);
 	case BMS_BLE_TYPE_LIPOWER: return lbm_enc_sym(sym_lipower);
+	case BMS_BLE_TYPE_LITECH: return lbm_enc_sym(sym_litech);
 	default: return lbm_enc_sym(sym_unknown);
 	}
 }
@@ -1474,6 +1577,7 @@ static bool sym_to_type(lbm_value v, bms_ble_type_t *t) {
 	else if (s == sym_jbd) *t = BMS_BLE_TYPE_JBD;
 	else if (s == sym_daly) *t = BMS_BLE_TYPE_DALY;
 	else if (s == sym_lipower) *t = BMS_BLE_TYPE_LIPOWER;
+	else if (s == sym_litech) *t = BMS_BLE_TYPE_LITECH;
 	else return false;
 	return true;
 }
@@ -1668,6 +1772,7 @@ static lbm_value ext_get(lbm_value *args, lbm_uint argn) {
 	case 17: return d.valid ? lbm_enc_float(UTILS_AGE_S(d.update_time)) : lbm_enc_float(-1.0f);
 	case 18: return lbm_enc_u32(d.runtime_s);
 	case 19: return lbm_enc_i(d.proto_variant);
+	case 20: return lbm_enc_float(d.soh);
 	default:
 		lbm_set_error_reason("Unknown key");
 		return ENC_SYM_EERROR;
@@ -1711,6 +1816,7 @@ void bms_ble_load_extensions(void) {
 	lbm_add_symbol_const("jbd", &sym_jbd);
 	lbm_add_symbol_const("daly", &sym_daly);
 	lbm_add_symbol_const("lipower", &sym_lipower);
+	lbm_add_symbol_const("litech", &sym_litech);
 	lbm_add_symbol_const("unknown", &sym_unknown);
 	lbm_add_symbol_const("disabled", &sym_disabled);
 	lbm_add_symbol_const("idle", &sym_idle);

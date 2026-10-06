@@ -28,6 +28,7 @@
  *   - Daly smart BMS                     (service 0xFFF0, notify 0xFFF1, write 0xFFF2)
  *     Protocol variants: Modbus 0xD2, Modbus 0x81 (newer K/H series), legacy 0xA5
  *   - LiPower / Ective                   (service 0xFFE0, notify+write 0xFFE1)
+ *   - LiTech "BT-BMS-xxxx"               (Nordic UART service, Modbus RTU slave 1, live data at 0xD000)
  */
 
 #ifndef MAIN_BMS_BLE_H_
@@ -47,6 +48,7 @@ typedef enum {
 	BMS_BLE_TYPE_JBD,
 	BMS_BLE_TYPE_DALY,
 	BMS_BLE_TYPE_LIPOWER,
+	BMS_BLE_TYPE_LITECH,
 	BMS_BLE_TYPE_UNKNOWN,
 } bms_ble_type_t;
 
@@ -77,6 +79,7 @@ typedef struct {
 	float voltage;
 	float current;			// A, positive = charging
 	float soc;				// 0.0 - 1.0
+	float soh;				// 0.0 - 1.0
 	float ah_remain;
 	float ah_nominal;
 	uint32_t cycles;

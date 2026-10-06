@@ -1,4 +1,4 @@
-; External BMS over BLE (JBD, Daly, LiPower)
+; External BMS over BLE (JBD, Daly, LiPower, LiTech)
 ;
 ; The firmware connects to the BMS in the background and keeps the
 ; connection alive. The VESC Tool BLE link stays usable at the same time.
@@ -9,7 +9,7 @@
 ;   (bms-ble-scan [seconds])     start a scan (non blocking)
 ;   (bms-ble-scanning)           t while the scan runs
 ;   (bms-ble-scan-results)       ((name mac rssi type) ...)
-;   (bms-ble-connect mac [type]) type: 'auto 'jbd 'daly 'lipower, default 'auto
+;   (bms-ble-connect mac [type]) type: 'auto 'jbd 'daly 'lipower 'litech, default 'auto
 ;   (bms-ble-disconnect)
 ;   (bms-ble-connected)
 ;   (bms-ble-state)              'disabled 'idle 'connecting 'connected
@@ -24,15 +24,15 @@
 ;   (bms-ble-debug bool)            print connection debug output
 
 ; The selected BMS is stored in the EEPROM emulation:
-;   addr 0: upper 3 MAC bytes, addr 1: lower 3 MAC bytes, addr 2: type (0 auto 1 jbd 2 daly 3 lipower)
+;   addr 0: upper 3 MAC bytes, addr 1: lower 3 MAC bytes, addr 2: type (0 auto 1 jbd 2 daly 3 lipower 4 litech)
 (def eeprom-mac-hi 0)
 (def eeprom-mac-lo 1)
 (def eeprom-type 2)
 
 (defun type-to-int (ty)
-    (cond ((eq ty 'jbd) 1) ((eq ty 'daly) 2) ((eq ty 'lipower) 3) (t 0)))
+    (cond ((eq ty 'jbd) 1) ((eq ty 'daly) 2) ((eq ty 'lipower) 3) ((eq ty 'litech) 4) (t 0)))
 (defun int-to-type (i)
-    (cond ((= i 1) 'jbd) ((= i 2) 'daly) ((= i 3) 'lipower) (t 'auto)))
+    (cond ((= i 1) 'jbd) ((= i 2) 'daly) ((= i 3) 'lipower) ((= i 4) 'litech) (t 'auto)))
 
 ; "A5:C2:37:17:C7:1A" -> (0xA5C237 0x17C71A)
 (defun mac-to-ints (mac) {

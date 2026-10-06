@@ -14,6 +14,7 @@ connection keeps working at the same time, both links share the radio.
 | `jbd`     | 0xFF00, notify 0xFF01, write 0xFF02    | JBD / Jiabaida / Overkill Solar, commands 0x03 and 0x04              |
 | `daly`    | 0xFFF0, notify 0xFFF1, write 0xFFF2    | Daly Modbus 0xD2 (most BLE dongles), Modbus 0x81 (K/H series), legacy 0xA5 frames. The variant is detected automatically. |
 | `lipower` | 0xFFE0, notify + write 0xFFE1          | LiPower / Ective, Modbus register 0x0400. Only pack values, no cell voltages. |
+| `litech`  | Nordic UART 6e400001, notify 6e400003, write 6e400002 | LiTech "BT-BMS-xxxx" (Silicon Labs module), Modbus RTU slave 1, live block 0xD000..0xD03A: 32 cell registers (0xEE49 = unused), pack voltage, 4 temperatures, SOC, SOH, remaining / design capacity, cycles. The current register is not verified yet, 0xD032 is used. |
 
 ## How it works
 
@@ -40,8 +41,10 @@ connection keeps working at the same time, both links share the radio.
 (bms-ble-scan [seconds])        ; start a scan, returns immediately
 (bms-ble-scanning)              ; t while the scan runs
 (bms-ble-scan-stop)
-(bms-ble-scan-results)          ; ((name mac rssi type) ...), type is 'jbd 'daly 'lipower or 'unknown
-(bms-ble-connect mac [type])    ; mac as "A5:C2:37:17:C7:1A", type 'auto (default) 'jbd 'daly 'lipower
+(bms-ble-scan-results)          ; ((name mac rssi type) ...), type is 'jbd 'daly 'lipower 'litech or 'unknown
+                                ; detected from the advertised service UUID, the Daly manufacturer id or the
+                                ; name prefix (JBD-, DL-, BT-BMS-)
+(bms-ble-connect mac [type])    ; mac as "A5:C2:37:17:C7:1A", type 'auto (default) 'jbd 'daly 'lipower 'litech
 (bms-ble-disconnect)            ; disconnect and stop reconnecting
 (bms-ble-connected)
 (bms-ble-state)                 ; 'disabled 'idle 'connecting 'connected
@@ -56,7 +59,7 @@ connection keeps working at the same time, both links share the radio.
 
 Keys for `bms-ble-get`: `voltage`, `current` (positive = charging), `soc`
 (0..1), `ah-remain`, `ah-nominal`, `cycles`, `cell-count`, `temp-count`,
-`cell-min`, `cell-max`, `temp-mos` (nil when the BMS does not report it),
+`soh`, `cell-min`, `cell-max`, `temp-mos` (nil when the BMS does not report it),
 `chg-fet`, `dis-fet`, `balance`, `problem`, `msg-count`, `err-count`, `age`
 (seconds since the last update, -1 when nothing was received), `runtime`,
 `variant` (detected protocol variant).
