@@ -46,6 +46,9 @@
 #include "esp_gattc_api.h"
 #include "esp_gatt_defs.h"
 #include "esp_gatt_common_api.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
 
 // Settings
 #define BMS_GATTC_APP_ID		1
@@ -112,6 +115,15 @@ static const uint8_t UUID_NUS_RX[16]  = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA
 #define DBG_LINES				6
 #define DBG_LINE_LEN			96
 #define DBG(fmt, ...) do { if (m_debug) { dbg_push(fmt, ##__VA_ARGS__); } } while (0)
+
+// Progress marker that survives a reset (RTC memory), used to find the
+// stage a crash happened in without a serial console.
+#define STAGE_MAGIC				0xB35B1E00
+static RTC_NOINIT_ATTR uint32_t m_stage_rtc;
+static uint32_t m_last_stage = 0;
+static int m_reset_reason = 0;
+
+#define STAGE(n) do { m_stage_rtc = STAGE_MAGIC | (n); } while (0)
 
 // Private variables
 static esp_gatt_if_t m_gattc_if = ESP_GATT_IF_NONE;
@@ -386,6 +398,7 @@ static void scan_result(struct ble_scan_result_evt_param *r) {
 	if (m_state == BMS_BLE_STATE_CONNECTING && !m_target_seen && !m_open_requested &&
 			memcmp(r->bda, m_target_addr, 6) == 0) {
 		m_target_seen = true;
+		STAGE(3);
 		DBG("Target found (rssi %d, addr type %d)", r->rssi, r->ble_addr_type);
 		m_open_after_scan_stop = true;
 		esp_ble_gap_stop_scanning();
@@ -455,6 +468,7 @@ static void do_open(void) {
 		return;
 	}
 	m_open_requested = true;
+	STAGE(4);
 	DBG("Opening %02X:%02X:%02X:%02X:%02X:%02X type %s", m_target_addr[0], m_target_addr[1],
 			m_target_addr[2], m_target_addr[3], m_target_addr[4], m_target_addr[5], type_name(m_target_type));
 	esp_ble_gap_set_prefer_conn_params(m_target_addr, BMS_CONN_INT_DISC_MIN, BMS_CONN_INT_DISC_MAX, 0, BMS_CONN_TIMEOUT);
@@ -609,6 +623,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 				break;
 			}
 			DBG("Open ok, conn_id %d", m_conn.conn_id);
+			STAGE(5);
 			m_target_addr_known = true;
 			// One GATT procedure at a time: the service search starts in
 			// ESP_GATTC_CFG_MTU_EVT, like the esp-idf gatt_client example.
@@ -625,6 +640,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 	case ESP_GATTC_CFG_MTU_EVT:
 		if (m_conn.open && param->cfg_mtu.conn_id == m_conn.conn_id) {
 			DBG("MTU %d", param->cfg_mtu.mtu);
+			STAGE(6);
 			esp_ble_gattc_search_service(gattc_if, m_conn.conn_id, NULL);
 		}
 		break;
@@ -665,15 +681,18 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 		if (param->search_cmpl.conn_id != m_conn.conn_id) {
 			break;
 		}
+		STAGE(7);
 		if (m_conn.type == BMS_BLE_TYPE_UNKNOWN) {
 			DBG("No supported BMS service found");
 			esp_ble_gattc_close(gattc_if, m_conn.conn_id);
 		} else {
 			discover_chars();
+			STAGE(8);
 		}
 		break;
 
 	case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
+		STAGE(9);
 		if (param->reg_for_notify.status != ESP_GATT_OK) {
 			DBG("Notify reg failed: %d", param->reg_for_notify.status);
 			esp_ble_gattc_close(gattc_if, m_conn.conn_id);
@@ -700,6 +719,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 		}
 		if (param->write.status == ESP_GATT_OK) {
 			DBG("Subscribed");
+			STAGE(10);
 			m_conn.subscribed = true;
 
 			esp_ble_conn_update_params_t cp = {
@@ -769,6 +789,7 @@ static bool send_cmd(const uint8_t *cmd, int len, uint8_t expect, uint8_t expect
 	m_stage_frames = 0;
 	xSemaphoreTake(m_rx_sem, 0);
 
+	STAGE(11);
 	esp_err_t r = esp_ble_gattc_write_char(m_gattc_if, m_conn.conn_id, m_conn.tx_handle, len,
 			(uint8_t *)cmd, m_conn.tx_write_nr ? ESP_GATT_WRITE_TYPE_NO_RSP : ESP_GATT_WRITE_TYPE_RSP,
 			ESP_GATT_AUTH_REQ_NONE);
@@ -804,6 +825,7 @@ static void rx_reset(void) {
 }
 
 static void rx_done(void) {
+	STAGE(12);
 	m_rx_valid = true;
 	xSemaphoreGive(m_rx_sem);
 }
@@ -1380,13 +1402,16 @@ static bool proto_poll(void) {
 		unlock();
 	}
 
+	STAGE(13);
 	if (m_update_vesc) {
 		update_vesc_bms();
+		STAGE(14);
 		if (m_send_can) {
 			// Forward to the VESC on the CAN bus, like the OW BMS bridge does
 			bms_send_status_can();
 		}
 	}
+	STAGE(15);
 
 	return true;
 }
@@ -1437,6 +1462,7 @@ static void begin_connect(void) {
 	m_target_seen = false;
 	m_open_after_scan_stop = false;
 	m_state = BMS_BLE_STATE_CONNECTING;
+	STAGE(1);
 	memset(&m_work, 0, sizeof(m_work));
 	m_work.soh = 1.0f;
 	if (m_target_addr_known) {
@@ -1540,6 +1566,12 @@ void bms_ble_init(void) {
 	if (m_task != NULL) {
 		return;
 	}
+
+	m_reset_reason = (int)esp_reset_reason();
+	if ((m_stage_rtc & 0xFFFFFF00) == STAGE_MAGIC) {
+		m_last_stage = m_stage_rtc & 0xFF;
+	}
+	m_stage_rtc = STAGE_MAGIC;
 
 	m_mutex = xSemaphoreCreateMutex();
 	m_rx_sem = xSemaphoreCreateBinary();
@@ -1961,6 +1993,19 @@ static lbm_value ext_set_send_can(lbm_value *args, lbm_uint argn) {
 	return ENC_SYM_TRUE;
 }
 
+// (bms-ble-stats) -> (reset-reason stage-before-reset current-stage free-heap min-free-heap task-stack-free)
+static lbm_value ext_stats(lbm_value *args, lbm_uint argn) {
+	(void)args; (void)argn;
+	lbm_value res = ENC_SYM_NIL;
+	res = lbm_cons(lbm_enc_i(m_task ? (int)uxTaskGetStackHighWaterMark(m_task) * (int)sizeof(StackType_t) : -1), res);
+	res = lbm_cons(lbm_enc_u32(heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT)), res);
+	res = lbm_cons(lbm_enc_u32(heap_caps_get_free_size(MALLOC_CAP_DEFAULT)), res);
+	res = lbm_cons(lbm_enc_i(m_stage_rtc & 0xFF), res);
+	res = lbm_cons(lbm_enc_i(m_last_stage), res);
+	res = lbm_cons(lbm_enc_i(m_reset_reason), res);
+	return res;
+}
+
 static lbm_value ext_debug(lbm_value *args, lbm_uint argn) {
 	LBM_CHECK_ARGN(1);
 	bms_ble_set_debug(lbm_dec_bool(args[0]));
@@ -1998,6 +2043,7 @@ void bms_ble_load_extensions(void) {
 	lbm_add_extension("bms-ble-set-update-vesc", ext_set_update_vesc);
 	lbm_add_extension("bms-ble-set-send-can", ext_set_send_can);
 	lbm_add_extension("bms-ble-debug", ext_debug);
+	lbm_add_extension("bms-ble-stats", ext_stats);
 }
 
 #else
