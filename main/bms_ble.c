@@ -191,6 +191,7 @@ static int m_stage_frames = 0;
 
 static bms_ble_data_t m_data;
 static bms_ble_data_t m_work;
+static bool m_ffe0_probed = false;	// 0xFFE0 protocol identified for this connection
 
 // Private functions
 static void bms_ble_task(void *arg);
@@ -246,6 +247,8 @@ static const char *type_name(bms_ble_type_t t) {
 	case BMS_BLE_TYPE_DALY: return "daly";
 	case BMS_BLE_TYPE_LIPOWER: return "lipower";
 	case BMS_BLE_TYPE_LITECH: return "litech";
+	case BMS_BLE_TYPE_JK: return "jk";
+	case BMS_BLE_TYPE_ANT: return "ant";
 	default: return "unknown";
 	}
 }
@@ -348,6 +351,12 @@ static bms_ble_type_t type_from_adv(uint8_t *adv, uint16_t len, const uint8_t *n
 	if (name && name_len >= 4 && memcmp(name, "JBD-", 4) == 0) {
 		return BMS_BLE_TYPE_JBD;
 	}
+	if (name && name_len >= 3 && (memcmp(name, "JK-", 3) == 0 || memcmp(name, "JK_", 3) == 0)) {
+		return BMS_BLE_TYPE_JK;
+	}
+	if (name && name_len >= 3 && memcmp(name, "ANT", 3) == 0) {
+		return BMS_BLE_TYPE_ANT;
+	}
 
 	// Daly dongles often advertise no service UUID, only a manufacturer id
 	{
@@ -357,6 +366,9 @@ static bms_ble_type_t type_from_adv(uint8_t *adv, uint16_t len, const uint8_t *n
 			uint16_t id = m[0] | (m[1] << 8);
 			if (id == 0x102 || id == 0x104 || id == 0x302 || id == 0x303 || id == 0x402) {
 				return BMS_BLE_TYPE_DALY;
+			}
+			if (id == 0x0B65 || id == 0x4B4A) {
+				return BMS_BLE_TYPE_JK;
 			}
 		}
 	}
@@ -564,7 +576,10 @@ static void discover_chars(void) {
 	switch (m_conn.type) {
 	case BMS_BLE_TYPE_JBD: rx.uuid.uuid16 = UUID_JBD_RX; tx.uuid.uuid16 = UUID_JBD_TX; break;
 	case BMS_BLE_TYPE_DALY: rx.uuid.uuid16 = UUID_DALY_RX; tx.uuid.uuid16 = UUID_DALY_TX; break;
-	case BMS_BLE_TYPE_LIPOWER: rx.uuid.uuid16 = UUID_LIPOWER_RXTX; tx.uuid.uuid16 = UUID_LIPOWER_RXTX; same = true; break;
+	case BMS_BLE_TYPE_LIPOWER:
+	case BMS_BLE_TYPE_JK:
+	case BMS_BLE_TYPE_ANT:
+		rx.uuid.uuid16 = UUID_LIPOWER_RXTX; tx.uuid.uuid16 = UUID_LIPOWER_RXTX; same = true; break;
 	case BMS_BLE_TYPE_LITECH:
 		rx.len = ESP_UUID_LEN_128;
 		tx.len = ESP_UUID_LEN_128;
@@ -662,7 +677,10 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 				} else if (uuid == UUID_DALY_SVC) {
 					t = BMS_BLE_TYPE_DALY;
 				} else if (uuid == UUID_LIPOWER_SVC) {
-					t = BMS_BLE_TYPE_LIPOWER;
+					// Shared by LiPower, JK and ANT. Keep an explicit type,
+					// otherwise the protocol is probed after subscribing.
+					t = (m_target_type == BMS_BLE_TYPE_JK || m_target_type == BMS_BLE_TYPE_ANT) ?
+							m_target_type : BMS_BLE_TYPE_LIPOWER;
 				}
 			} else if (param->search_res.srvc_id.uuid.len == ESP_UUID_LEN_128 &&
 					memcmp(param->search_res.srvc_id.uuid.uuid.uuid128, UUID_NUS_SVC, 16) == 0) {
@@ -1332,12 +1350,396 @@ static bool litech_poll(void) {
 }
 
 // ---------------------------------------------------------------------------
+// JK / Jikong protocol (JK02 records, 300 bytes, little endian)
+// ---------------------------------------------------------------------------
+
+#define JK_FRAME_LEN			300
+#define JK_VARIANT_32S			1
+#define JK_VARIANT_24S			2
+static const uint8_t JK_HEAD_RSP[4] = {0x55, 0xAA, 0xEB, 0x90};
+static const uint8_t JK_HEAD_CMD[4] = {0xAA, 0x55, 0x90, 0xEB};
+static const uint8_t JK_AT_MSG[4] = {0x41, 0x54, 0x0D, 0x0A}; // "AT\r\n" from the BLE module
+static int m_jk_sw_version = 0;
+
+static uint16_t le16(const uint8_t *p) {
+	return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t le32(const uint8_t *p) {
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void jk_on_rx(const uint8_t *data, uint16_t len) {
+	if (len >= 4 && memcmp(data, JK_AT_MSG, 4) == 0) {
+		data += 4;
+		len -= 4;
+		if (len == 0) {
+			return;
+		}
+	}
+
+	bool is_head = len >= 4 && (memcmp(data, JK_HEAD_RSP, 4) == 0 || memcmp(data, JK_HEAD_CMD, 4) == 0);
+	if (is_head || m_rx_len < 4 || memcmp(m_rx_buf, JK_HEAD_RSP, 4) != 0) {
+		m_rx_len = 0;
+	}
+	if (m_rx_len + len > RX_BUF_SIZE) {
+		m_rx_len = 0;
+		return;
+	}
+	memcpy(&m_rx_buf[m_rx_len], data, len);
+	m_rx_len += len;
+
+	if (m_rx_len < JK_FRAME_LEN || memcmp(m_rx_buf, JK_HEAD_RSP, 4) != 0) {
+		return;
+	}
+	if (m_rx_buf[4] != m_rx_expect) {
+		m_rx_len = 0;
+		return;
+	}
+	uint8_t sum = 0;
+	for (int i = 0; i < JK_FRAME_LEN - 1; i++) {
+		sum += m_rx_buf[i];
+	}
+	if (sum != m_rx_buf[JK_FRAME_LEN - 1]) {
+		m_work.err_count++;
+		m_rx_len = 0;
+		return;
+	}
+	m_rx_len = JK_FRAME_LEN;
+	rx_done();
+}
+
+static bool jk_send(uint8_t cmd, uint8_t expect) {
+	uint8_t f[20];
+	memcpy(f, JK_HEAD_CMD, 4);
+	f[4] = cmd;
+	memset(&f[5], 0, 14);
+	uint8_t sum = 0;
+	for (int i = 0; i < 19; i++) {
+		sum += f[i];
+	}
+	f[19] = sum;
+	return send_cmd(f, 20, expect, 0);
+}
+
+static bool jk_wait_cell_info(void) {
+	// The BMS pushes cell info records by itself once requested
+	if (wait_rx(CMD_TIMEOUT_MS)) {
+		return true;
+	}
+	return jk_send(0x96, 0x02) && wait_rx(CMD_TIMEOUT_MS);
+}
+
+static bool jk_poll(void) {
+	if (m_work.proto_variant == 0) {
+		// Device info first: the record layout depends on the firmware version
+		if (!jk_send(0x97, 0x03) || !wait_rx(CMD_TIMEOUT_MS)) {
+			return false;
+		}
+		const uint8_t *s = &m_rx_buf[30];
+		int v = 0;
+		for (int i = 0; i < 8 && s[i] != 0; i++) {
+			if (s[i] >= '0' && s[i] <= '9') {
+				v = v * 10 + (s[i] - '0');
+			} else if (v > 0) {
+				break;
+			}
+		}
+		m_jk_sw_version = v;
+		m_work.proto_variant = v < 11 ? JK_VARIANT_24S : JK_VARIANT_32S;
+		DBG("JK sw version %d", v);
+
+		m_rx_len = 0;
+		m_rx_valid = false;
+		m_rx_expect = 0x02;
+		xSemaphoreTake(m_rx_sem, 0);
+		if (!jk_send(0x96, 0x02) || !wait_rx(CMD_TIMEOUT_MS)) {
+			return false;
+		}
+	} else {
+		m_rx_len = 0;
+		m_rx_valid = false;
+		m_rx_expect = 0x02;
+		xSemaphoreTake(m_rx_sem, 0);
+		if (!jk_wait_cell_info()) {
+			return false;
+		}
+	}
+
+	const uint8_t *d = m_rx_buf;
+	int offs = m_work.proto_variant == JK_VARIANT_24S ? -32 : 0;
+	int ho = offs / 2;
+
+	uint32_t mask = le32(&d[70 + ho]);
+	int nc = 0;
+	for (int i = 0; i < 32; i++) {
+		if (mask & (1u << i)) {
+			nc++;
+		}
+	}
+	if (nc > BMS_BLE_MAX_CELLS) {
+		nc = BMS_BLE_MAX_CELLS;
+	}
+	m_work.cell_count = nc;
+	for (int i = 0; i < nc; i++) {
+		m_work.cells[i] = le16(&d[6 + i * 2]) / 1000.0f;
+	}
+
+	m_work.voltage = le32(&d[150 + offs]) / 1000.0f;
+	m_work.current = (int32_t)le32(&d[158 + offs]) / 1000.0f;
+	uint32_t problem = le32(&d[166 + offs]);
+	m_work.problem = offs ? (problem >> 16) : (problem & 0xFFFF);
+	m_work.balance_bits = d[172 + offs] ? 0xFFFFFFFF : 0;
+	m_work.soc = d[173 + offs] / 100.0f;
+	m_work.ah_remain = le32(&d[174 + offs]) / 1000.0f;
+	m_work.ah_nominal = le32(&d[178 + offs]) / 1000.0f;
+	m_work.cycles = le32(&d[182 + offs]);
+	m_work.soh = d[190 + offs] / 100.0f;
+	m_work.chg_fet = d[198 + offs] != 0;
+	m_work.dis_fet = d[199 + offs] != 0;
+
+	// Temperatures: pack sensors into temps[], the MOSFET sensor separately
+	uint16_t tmask = le16(&d[214 + offs]);
+	int nt = 0;
+	m_work.temp_mos_valid = false;
+	if (m_jk_sw_version >= 11) {
+		const int pos[6] = {144, 162, 164, 254, 256, 258};
+		int n = m_jk_sw_version >= 14 ? 6 : 4;
+		for (int i = 0; i < n; i++) {
+			if (!(tmask & (1 << i))) {
+				continue;
+			}
+			int16_t raw = (int16_t)le16(&d[pos[i]]);
+			if (raw == -2000) {
+				continue;
+			}
+			if (i == 0 || i == 3) {
+				if (!m_work.temp_mos_valid) {
+					m_work.temp_mos = raw / 10.0f;
+					m_work.temp_mos_valid = true;
+				}
+			} else if (nt < BMS_BLE_MAX_TEMPS) {
+				m_work.temps[nt++] = raw / 10.0f;
+			}
+		}
+	} else {
+		const int pos[3] = {130, 132, 134};
+		for (int i = 0; i < 3; i++) {
+			if (!(tmask & (1 << i))) {
+				continue;
+			}
+			int16_t raw = (int16_t)le16(&d[pos[i]]);
+			if (raw == -2000) {
+				continue;
+			}
+			if (i == 2) {
+				m_work.temp_mos = raw / 10.0f;
+				m_work.temp_mos_valid = true;
+			} else if (nt < BMS_BLE_MAX_TEMPS) {
+				m_work.temps[nt++] = raw / 10.0f;
+			}
+		}
+	}
+	m_work.temp_count = nt;
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// ANT protocol: 7E A1 cmd adr(LE16) len [data] crc16(LE, modbus over [1..]) AA 55
+// and the legacy variant: DB DB 00 00 00 00 -> AA 55 AA FF ... (140 bytes, big endian)
+// ---------------------------------------------------------------------------
+
+#define ANT_VARIANT_NEW			1
+#define ANT_VARIANT_LEGACY		2
+#define ANT_LEG_FRAME_LEN		140
+
+static void ant_on_rx(void) {
+	if (m_rx_buf[0] != 0x7E || (m_rx_len >= 2 && m_rx_buf[1] != 0xA1)) {
+		rx_reset();
+		return;
+	}
+	if (m_rx_len < 6) {
+		return;
+	}
+	int total = m_rx_buf[5] + 10;
+	if (total > RX_BUF_SIZE) {
+		rx_reset();
+		return;
+	}
+	if (m_rx_len < total) {
+		return;
+	}
+	if (m_rx_buf[2] != m_rx_expect || m_rx_buf[total - 2] != 0xAA || m_rx_buf[total - 1] != 0x55) {
+		rx_reset();
+		return;
+	}
+	uint16_t crc = crc_modbus(&m_rx_buf[1], total - 5);
+	uint16_t got = m_rx_buf[total - 4] | (m_rx_buf[total - 3] << 8);
+	if (crc != got) {
+		m_work.err_count++;
+		rx_reset();
+		return;
+	}
+	m_rx_len = total;
+	rx_done();
+}
+
+static void ant_leg_on_rx(void) {
+	static const uint8_t head[4] = {0xAA, 0x55, 0xAA, 0xFF};
+	int n = m_rx_len < 4 ? m_rx_len : 4;
+	if (memcmp(m_rx_buf, head, n) != 0) {
+		rx_reset();
+		return;
+	}
+	if (m_rx_len < ANT_LEG_FRAME_LEN) {
+		return;
+	}
+	uint16_t sum = 0;
+	for (int i = 4; i < ANT_LEG_FRAME_LEN - 2; i++) {
+		sum += m_rx_buf[i];
+	}
+	if (sum != be16(&m_rx_buf[ANT_LEG_FRAME_LEN - 2])) {
+		m_work.err_count++;
+		rx_reset();
+		return;
+	}
+	m_rx_len = ANT_LEG_FRAME_LEN;
+	rx_done();
+}
+
+static bool ant_poll_new(void) {
+	// Status request: cmd 0x01, address 0, 0xBE bytes
+	uint8_t f[10] = {0x7E, 0xA1, 0x01, 0x00, 0x00, 0xBE};
+	uint16_t crc = crc_modbus(&f[1], 5);
+	f[6] = crc & 0xFF;
+	f[7] = crc >> 8;
+	f[8] = 0xAA;
+	f[9] = 0x55;
+	if (!transact(f, 10, 0x11, 0)) {
+		return false;
+	}
+
+	const uint8_t *d = m_rx_buf;
+	int nt = d[8] > 6 ? 6 : d[8];
+	int nc = d[9] > BMS_BLE_MAX_CELLS ? BMS_BLE_MAX_CELLS : d[9];
+	int total = m_rx_len;
+	if (34 + nc * 2 + (nt + 2) * 2 + 90 > total) {
+		return false;
+	}
+
+	m_work.cell_count = nc;
+	for (int i = 0; i < nc; i++) {
+		m_work.cells[i] = le16(&d[34 + i * 2]) / 1000.0f;
+	}
+	int tp = 34 + nc * 2;
+	m_work.temp_count = nt > BMS_BLE_MAX_TEMPS ? BMS_BLE_MAX_TEMPS : nt;
+	for (int i = 0; i < m_work.temp_count; i++) {
+		m_work.temps[i] = (int16_t)le16(&d[tp + i * 2]);
+	}
+	m_work.temp_mos = (int16_t)le16(&d[tp + nt * 2]);
+	m_work.temp_mos_valid = true;
+
+	int s = (nt + nc) * 2;
+	m_work.voltage = le16(&d[38 + s]) / 100.0f;
+	m_work.current = (int16_t)le16(&d[40 + s]) / 10.0f;
+	m_work.soc = le16(&d[42 + s]) / 100.0f;
+	m_work.soh = le16(&d[44 + s]) / 100.0f;
+	uint16_t st = le16(&d[46 + s]);
+	m_work.chg_fet = d[46 + s] == 0x01;
+	m_work.dis_fet = d[47 + s] == 0x01;
+	m_work.balance_bits = (d[48 + s] & 0x04) ? 0xFFFFFFFF : 0;
+	m_work.problem = ((st >> 8) != 0x1 && (st >> 8) != 0x4 && (st >> 8) != 0xF ? (st & 0xF00) : 0) |
+			((st & 0xF) != 0x1 && (st & 0xF) != 0x4 && (st & 0xF) != 0xB && (st & 0xF) != 0xF ? (st & 0xF) : 0);
+	m_work.ah_nominal = le32(&d[50 + s]) / 1000000.0f;
+	m_work.ah_remain = le32(&d[54 + s]) / 1000000.0f;
+	m_work.cycles = 0;
+	return true;
+}
+
+static bool ant_poll_legacy(void) {
+	uint8_t f[6] = {0xDB, 0xDB, 0x00, 0x00, 0x00, 0x00};
+	if (!transact(f, 6, 0xFF, 0)) {
+		return false;
+	}
+
+	const uint8_t *d = m_rx_buf;
+	m_work.voltage = be16(&d[4]) / 10.0f;
+	int nc = d[123] > BMS_BLE_MAX_CELLS ? BMS_BLE_MAX_CELLS : d[123];
+	m_work.cell_count = nc;
+	for (int i = 0; i < nc; i++) {
+		m_work.cells[i] = be16(&d[6 + i * 2]) / 1000.0f;
+	}
+	int32_t cur = (int32_t)(((uint32_t)d[70] << 24) | ((uint32_t)d[71] << 16) | ((uint32_t)d[72] << 8) | d[73]);
+	m_work.current = cur / -10.0f;
+	m_work.soc = d[74] / 100.0f;
+	m_work.ah_nominal = (((uint32_t)d[75] << 24) | ((uint32_t)d[76] << 16) | ((uint32_t)d[77] << 8) | d[78]) / 1000000.0f;
+	m_work.ah_remain = (((uint32_t)d[79] << 24) | ((uint32_t)d[80] << 16) | ((uint32_t)d[81] << 8) | d[82]) / 1000000.0f;
+	m_work.temp_count = 4;
+	for (int i = 0; i < 4; i++) {
+		m_work.temps[i] = (int16_t)be16(&d[91 + i * 2]);
+	}
+	m_work.temp_mos_valid = false;
+	uint16_t st = be16(&d[103]);
+	m_work.chg_fet = d[103] == 0x01;
+	m_work.dis_fet = d[104] == 0x01;
+	m_work.balance_bits = (d[105] & 0x04) ? 0xFFFFFFFF : 0;
+	m_work.problem = ((st >> 8) != 0x1 && (st >> 8) != 0x4 && (st >> 8) != 0xF ? (st & 0xF00) : 0) |
+			((st & 0xF) != 0x1 && (st & 0xF) != 0x4 && (st & 0xF) != 0xB && (st & 0xF) != 0xF ? (st & 0xF) : 0);
+	m_work.cycles = 0;
+	m_work.soh = 1.0f;
+	return true;
+}
+
+static bool ant_poll(void) {
+	if (m_work.proto_variant == 0) {
+		if (ant_poll_new()) {
+			m_work.proto_variant = ANT_VARIANT_NEW;
+		} else if (ant_poll_legacy()) {
+			m_work.proto_variant = ANT_VARIANT_LEGACY;
+		} else {
+			return false;
+		}
+		DBG("ANT protocol variant %d", m_work.proto_variant);
+		return true;
+	}
+	return m_work.proto_variant == ANT_VARIANT_NEW ? ant_poll_new() : ant_poll_legacy();
+}
+
+// 0xFFE0 with type 'auto: find out who is talking
+static bool ffe0_probe(void) {
+	const bms_ble_type_t order[] = {BMS_BLE_TYPE_JK, BMS_BLE_TYPE_ANT, BMS_BLE_TYPE_LIPOWER};
+	for (int i = 0; i < 3; i++) {
+		m_conn.type = order[i];
+		m_work.proto_variant = 0;
+		m_work.err_count = m_data.err_count;
+		bool ok = false;
+		switch (order[i]) {
+		case BMS_BLE_TYPE_JK: ok = jk_poll(); break;
+		case BMS_BLE_TYPE_ANT: ok = ant_poll(); break;
+		default: ok = lipower_poll(); break;
+		}
+		if (ok) {
+			DBG("0xFFE0 device answers as %s", type_name(order[i]));
+			m_ffe0_probed = true;
+			return true;
+		}
+	}
+	m_conn.type = BMS_BLE_TYPE_LIPOWER;
+	return false;
+}
+
+// ---------------------------------------------------------------------------
 // Protocol dispatch
 // ---------------------------------------------------------------------------
 
 static void proto_on_rx(const uint8_t *data, uint16_t len) {
 	if (m_rx_valid) {
 		return; // Previous reply not consumed yet
+	}
+
+	if (m_conn.type == BMS_BLE_TYPE_JK) {
+		jk_on_rx(data, len); // Handles its own buffering
+		return;
 	}
 
 	if (m_rx_len + len > RX_BUF_SIZE) {
@@ -1361,6 +1763,13 @@ static void proto_on_rx(const uint8_t *data, uint16_t len) {
 	case BMS_BLE_TYPE_LITECH:
 		modbus_on_rx();
 		break;
+	case BMS_BLE_TYPE_ANT:
+		if (m_rx_expect == 0xFF) {
+			ant_leg_on_rx();
+		} else {
+			ant_on_rx();
+		}
+		break;
 	default:
 		m_rx_len = 0;
 		break;
@@ -1369,12 +1778,18 @@ static void proto_on_rx(const uint8_t *data, uint16_t len) {
 
 static bool proto_poll(void) {
 	bool ok = false;
-	switch (m_conn.type) {
-	case BMS_BLE_TYPE_JBD: ok = jbd_poll(); break;
-	case BMS_BLE_TYPE_DALY: ok = daly_poll(); break;
-	case BMS_BLE_TYPE_LIPOWER: ok = lipower_poll(); break;
-	case BMS_BLE_TYPE_LITECH: ok = litech_poll(); break;
-	default: break;
+	if (m_conn.type == BMS_BLE_TYPE_LIPOWER && m_target_type == BMS_BLE_TYPE_AUTO && !m_ffe0_probed) {
+		ok = ffe0_probe();
+	} else {
+		switch (m_conn.type) {
+		case BMS_BLE_TYPE_JBD: ok = jbd_poll(); break;
+		case BMS_BLE_TYPE_DALY: ok = daly_poll(); break;
+		case BMS_BLE_TYPE_LIPOWER: ok = lipower_poll(); break;
+		case BMS_BLE_TYPE_LITECH: ok = litech_poll(); break;
+		case BMS_BLE_TYPE_JK: ok = jk_poll(); break;
+		case BMS_BLE_TYPE_ANT: ok = ant_poll(); break;
+		default: break;
+		}
 	}
 
 	if (!ok) {
@@ -1468,6 +1883,7 @@ static void begin_connect(void) {
 	STAGE(1);
 	memset(&m_work, 0, sizeof(m_work));
 	m_work.soh = 1.0f;
+	m_ffe0_probed = false;
 	if (m_target_addr_known) {
 		m_target_seen = true;
 		DBG("Connecting directly (retry delay %lu ms)", (unsigned long)m_reconnect_delay);
@@ -1711,7 +2127,7 @@ void bms_ble_set_send_can(bool enabled) {
 // LispBM extensions
 // ---------------------------------------------------------------------------
 
-static lbm_uint sym_auto, sym_jbd, sym_daly, sym_lipower, sym_litech, sym_unknown;
+static lbm_uint sym_auto, sym_jbd, sym_daly, sym_lipower, sym_litech, sym_jk, sym_ant, sym_unknown;
 static lbm_uint sym_disabled, sym_idle, sym_connecting, sym_connected;
 
 typedef struct {
@@ -1746,6 +2162,8 @@ static lbm_value type_sym(bms_ble_type_t t) {
 	case BMS_BLE_TYPE_DALY: return lbm_enc_sym(sym_daly);
 	case BMS_BLE_TYPE_LIPOWER: return lbm_enc_sym(sym_lipower);
 	case BMS_BLE_TYPE_LITECH: return lbm_enc_sym(sym_litech);
+	case BMS_BLE_TYPE_JK: return lbm_enc_sym(sym_jk);
+	case BMS_BLE_TYPE_ANT: return lbm_enc_sym(sym_ant);
 	default: return lbm_enc_sym(sym_unknown);
 	}
 }
@@ -1760,6 +2178,8 @@ static bool sym_to_type(lbm_value v, bms_ble_type_t *t) {
 	else if (s == sym_daly) *t = BMS_BLE_TYPE_DALY;
 	else if (s == sym_lipower) *t = BMS_BLE_TYPE_LIPOWER;
 	else if (s == sym_litech) *t = BMS_BLE_TYPE_LITECH;
+	else if (s == sym_jk) *t = BMS_BLE_TYPE_JK;
+	else if (s == sym_ant) *t = BMS_BLE_TYPE_ANT;
 	else return false;
 	return true;
 }
@@ -2052,6 +2472,8 @@ void bms_ble_load_extensions(void) {
 	lbm_add_symbol_const("daly", &sym_daly);
 	lbm_add_symbol_const("lipower", &sym_lipower);
 	lbm_add_symbol_const("litech", &sym_litech);
+	lbm_add_symbol_const("jk", &sym_jk);
+	lbm_add_symbol_const("ant", &sym_ant);
 	lbm_add_symbol_const("unknown", &sym_unknown);
 	lbm_add_symbol_const("disabled", &sym_disabled);
 	lbm_add_symbol_const("idle", &sym_idle);

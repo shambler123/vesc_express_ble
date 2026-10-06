@@ -14,7 +14,14 @@ connection keeps working at the same time, both links share the radio.
 | `jbd`     | 0xFF00, notify 0xFF01, write 0xFF02    | JBD / Jiabaida / Overkill Solar, commands 0x03 and 0x04              |
 | `daly`    | 0xFFF0, notify 0xFFF1, write 0xFFF2    | Daly Modbus 0xD2 (most BLE dongles), Modbus 0x81 (K/H series), legacy 0xA5 frames. The variant is detected automatically. |
 | `lipower` | 0xFFE0, notify + write 0xFFE1          | LiPower / Ective, Modbus register 0x0400. Only pack values, no cell voltages. |
+| `jk`      | 0xFFE0, notify + write 0xFFE1          | JK / Jikong JK02 records (300 bytes). Device info is read first, the layout depends on the firmware version (24S below V11, 32S from V11). Names `JK-*`, manufacturer ids 0x0B65 / 0x4B4A. |
+| `ant`     | 0xFFE0, notify + write 0xFFE1          | ANT, protocol `7E A1` (status 0x01) and legacy `DB DB` (140 byte status), auto-detected. Names `ANT*`. |
 | `litech`  | Nordic UART 6e400001, notify 6e400003, write 6e400002 | LiTech "BT-BMS-xxxx" (Silicon Labs module), Modbus RTU slave 1, live block 0xD000..0xD03A: 32 cell registers (0xEE49 = unused), pack voltage, 4 temperatures, SOC, SOH, remaining / design capacity, cycles. The current register is not verified yet, 0xD032 is used. |
+
+0xFFE0 is shared by LiPower, JK and ANT. With type `auto` the firmware probes
+JK, ANT and LiPower in that order once the connection is up, so a scan result
+that only shows `lipower` for an unnamed 0xFFE0 device still connects to the
+right protocol.
 
 ## How it works
 
@@ -41,10 +48,10 @@ connection keeps working at the same time, both links share the radio.
 (bms-ble-scan [seconds])        ; start a scan, returns immediately
 (bms-ble-scanning)              ; t while the scan runs
 (bms-ble-scan-stop)
-(bms-ble-scan-results)          ; ((name mac rssi type) ...), type is 'jbd 'daly 'lipower 'litech or 'unknown
+(bms-ble-scan-results)          ; ((name mac rssi type) ...), type is 'jbd 'daly 'lipower 'litech 'jk 'ant or 'unknown
                                 ; detected from the advertised service UUID, the Daly manufacturer id or the
                                 ; name prefix (JBD-, DL-, BT-BMS-)
-(bms-ble-connect mac [type])    ; mac as "A5:C2:37:17:C7:1A", type 'auto (default) 'jbd 'daly 'lipower 'litech
+(bms-ble-connect mac [type])    ; mac as "A5:C2:37:17:C7:1A", type 'auto (default) 'jbd 'daly 'lipower 'litech 'jk 'ant
 (bms-ble-disconnect)            ; disconnect and stop reconnecting
 (bms-ble-connected)
 (bms-ble-state)                 ; 'disabled 'idle 'connecting 'connected

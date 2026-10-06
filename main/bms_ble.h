@@ -29,6 +29,11 @@
  *     Protocol variants: Modbus 0xD2, Modbus 0x81 (newer K/H series), legacy 0xA5
  *   - LiPower / Ective                   (service 0xFFE0, notify+write 0xFFE1)
  *   - LiTech "BT-BMS-xxxx"               (Nordic UART service, Modbus RTU slave 1, live data at 0xD000)
+ *   - JK / Jikong                        (service 0xFFE0, notify+write 0xFFE1, JK02 24S/32S records)
+ *   - ANT                                (service 0xFFE0, notify+write 0xFFE1, 0x7EA1 protocol or legacy 0xDBDB)
+ *
+ * 0xFFE0 is shared by LiPower, JK and ANT. With type 'auto the protocols are
+ * probed in the order JK, ANT, ANT legacy, LiPower after the connection is up.
  */
 
 #ifndef MAIN_BMS_BLE_H_
@@ -49,6 +54,8 @@ typedef enum {
 	BMS_BLE_TYPE_DALY,
 	BMS_BLE_TYPE_LIPOWER,
 	BMS_BLE_TYPE_LITECH,
+	BMS_BLE_TYPE_JK,
+	BMS_BLE_TYPE_ANT,
 	BMS_BLE_TYPE_UNKNOWN,
 } bms_ble_type_t;
 

@@ -9,7 +9,7 @@
 ;   (bms-ble-scan [seconds])     start a scan (non blocking)
 ;   (bms-ble-scanning)           t while the scan runs
 ;   (bms-ble-scan-results)       ((name mac rssi type) ...)
-;   (bms-ble-connect mac [type]) type: 'auto 'jbd 'daly 'lipower 'litech, default 'auto
+;   (bms-ble-connect mac [type]) type: 'auto 'jbd 'daly 'lipower 'litech 'jk 'ant, default 'auto
 ;   (bms-ble-disconnect)
 ;   (bms-ble-connected)
 ;   (bms-ble-state)              'disabled 'idle 'connecting 'connected
@@ -30,9 +30,9 @@
 (def eeprom-type 2)
 
 (defun type-to-int (ty)
-    (cond ((eq ty 'jbd) 1) ((eq ty 'daly) 2) ((eq ty 'lipower) 3) ((eq ty 'litech) 4) (t 0)))
+    (cond ((eq ty 'jbd) 1) ((eq ty 'daly) 2) ((eq ty 'lipower) 3) ((eq ty 'litech) 4) ((eq ty 'jk) 5) ((eq ty 'ant) 6) (t 0)))
 (defun int-to-type (i)
-    (cond ((= i 1) 'jbd) ((= i 2) 'daly) ((= i 3) 'lipower) ((= i 4) 'litech) (t 'auto)))
+    (cond ((= i 1) 'jbd) ((= i 2) 'daly) ((= i 3) 'lipower) ((= i 4) 'litech) ((= i 5) 'jk) ((= i 6) 'ant) (t 'auto)))
 
 ; "A5:C2:37:17:C7:1A" -> (0xA5C237 0x17C71A)
 (defun mac-to-ints (mac) {
