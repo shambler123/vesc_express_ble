@@ -30,6 +30,7 @@
 #include "freertos/semphr.h"
 
 #include "bms.h"
+#include "crash_log.h"
 #include "comm_ble.h"
 #include "commands.h"
 #include "utils.h"
@@ -2006,6 +2007,31 @@ static lbm_value ext_stats(lbm_value *args, lbm_uint argn) {
 	return res;
 }
 
+// (crash-info) -> nil, or (reason description task pc ra sp mcause mtval) of the last panic
+static lbm_value ext_crash_info(lbm_value *args, lbm_uint argn) {
+	(void)args; (void)argn;
+	const crash_log_t *c = crash_log_get();
+	if (!c->valid) {
+		return ENC_SYM_NIL;
+	}
+	lbm_value res = ENC_SYM_NIL;
+	res = lbm_cons(lbm_enc_u32(c->mtval), res);
+	res = lbm_cons(lbm_enc_u32(c->mcause), res);
+	res = lbm_cons(lbm_enc_u32(c->sp), res);
+	res = lbm_cons(lbm_enc_u32(c->ra), res);
+	res = lbm_cons(lbm_enc_u32(c->pc), res);
+	lbm_value task = make_str(c->task);
+	lbm_value desc = make_str(c->description);
+	lbm_value reason = make_str(c->reason);
+	if (task == ENC_SYM_MERROR || desc == ENC_SYM_MERROR || reason == ENC_SYM_MERROR) {
+		return ENC_SYM_MERROR;
+	}
+	res = lbm_cons(task, res);
+	res = lbm_cons(desc, res);
+	res = lbm_cons(reason, res);
+	return res;
+}
+
 static lbm_value ext_debug(lbm_value *args, lbm_uint argn) {
 	LBM_CHECK_ARGN(1);
 	bms_ble_set_debug(lbm_dec_bool(args[0]));
@@ -2044,6 +2070,7 @@ void bms_ble_load_extensions(void) {
 	lbm_add_extension("bms-ble-set-send-can", ext_set_send_can);
 	lbm_add_extension("bms-ble-debug", ext_debug);
 	lbm_add_extension("bms-ble-stats", ext_stats);
+	lbm_add_extension("crash-info", ext_crash_info);
 }
 
 #else

@@ -26,6 +26,7 @@
 #include "conf_general.h"
 #include "comm_ble.h"
 #include "bms_ble.h"
+#include "crash_log.h"
 #include "comm_uart.h"
 #include "comm_usb.h"
 #include "comm_can.h"
@@ -119,6 +120,7 @@ void app_main(void) {
 		nvs_close(my_handle);
 	}
 
+	crash_log_init();
 	adc_init();
 
 #ifdef HW_EARLY_LBM_INIT

@@ -24,6 +24,7 @@ set(COMPONENT_SRCS
 "rb.c"
 "bms.c"
 "bms_ble.c"
+"crash_log.c"
 "log_comm.c"
 "digital_filter.c"
 
@@ -151,6 +152,9 @@ set(COMPONENT_ADD_INCLUDEDIRS
 )
 
 register_component()
+
+# Keep the essentials of a panic in RTC memory (see crash_log.c)
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")
 
 add_compile_definitions(
     LBM_USE_DYN_FUNS
