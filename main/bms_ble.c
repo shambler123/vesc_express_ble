@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <math.h>
 
 #include "freertos/FreeRTOS.h"
@@ -105,7 +106,9 @@ static const uint8_t UUID_NUS_RX[16]  = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA
 #define DALY_VARIANT_X81		2
 #define DALY_VARIANT_A5			3
 
-#define DBG(fmt, ...) do { if (m_debug) { commands_printf_lisp("BMS-BLE: " fmt, ##__VA_ARGS__); } } while (0)
+#define DBG_LINES				6
+#define DBG_LINE_LEN			96
+#define DBG(fmt, ...) do { if (m_debug) { dbg_push(fmt, ##__VA_ARGS__); } } while (0)
 
 // Private variables
 static esp_gatt_if_t m_gattc_if = ESP_GATT_IF_NONE;
@@ -114,6 +117,12 @@ static SemaphoreHandle_t m_rx_sem = NULL;
 static TaskHandle_t m_task = NULL;
 static volatile bool m_debug = false;
 static volatile bool m_update_vesc = true;
+
+// Debug lines are queued here and printed by the supervisor task, since
+// commands_printf_lisp needs more stack than the Bluetooth task offers.
+static char m_dbg_lines[DBG_LINES][DBG_LINE_LEN];
+static volatile int m_dbg_head = 0;
+static volatile int m_dbg_tail = 0;
 
 static volatile bms_ble_state_t m_state = BMS_BLE_STATE_DISABLED;
 
@@ -173,6 +182,25 @@ static void update_vesc_bms(void);
 
 static uint32_t now_ms(void) {
 	return xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+static void dbg_push(const char *fmt, ...) {
+	int next = (m_dbg_head + 1) % DBG_LINES;
+	if (next == m_dbg_tail) {
+		return; // Full, drop
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(m_dbg_lines[m_dbg_head], DBG_LINE_LEN, fmt, ap);
+	va_end(ap);
+	m_dbg_head = next;
+}
+
+static void dbg_flush(void) {
+	while (m_dbg_tail != m_dbg_head) {
+		commands_printf_lisp("BMS-BLE: %s", m_dbg_lines[m_dbg_tail]);
+		m_dbg_tail = (m_dbg_tail + 1) % DBG_LINES;
+	}
 }
 
 static uint32_t age_ms(uint32_t t) {
@@ -554,12 +582,22 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 			memcpy(m_conn.bda, param->open.remote_bda, 6);
 			DBG("Open ok, conn_id %d", m_conn.conn_id);
 			m_target_addr_known = true;
-			esp_ble_gattc_send_mtu_req(gattc_if, m_conn.conn_id);
-			esp_ble_gattc_search_service(gattc_if, m_conn.conn_id, NULL);
+			// One GATT procedure at a time: the service search starts in
+			// ESP_GATTC_CFG_MTU_EVT, like the esp-idf gatt_client example.
+			if (esp_ble_gattc_send_mtu_req(gattc_if, m_conn.conn_id) != ESP_OK) {
+				esp_ble_gattc_search_service(gattc_if, m_conn.conn_id, NULL);
+			}
 		} else {
 			DBG("Open failed: %d", param->open.status);
 			m_state = BMS_BLE_STATE_IDLE;
 			schedule_retry();
+		}
+		break;
+
+	case ESP_GATTC_CFG_MTU_EVT:
+		if (m_conn.open && param->cfg_mtu.conn_id == m_conn.conn_id) {
+			DBG("MTU %d", param->cfg_mtu.mtu);
+			esp_ble_gattc_search_service(gattc_if, m_conn.conn_id, NULL);
 		}
 		break;
 
@@ -1386,6 +1424,7 @@ static void bms_ble_task(void *arg) {
 
 	for (;;) {
 		vTaskDelay(pdMS_TO_TICKS(TASK_PERIOD_MS));
+		dbg_flush();
 
 		switch (m_state) {
 		case BMS_BLE_STATE_DISABLED:
@@ -1475,7 +1514,7 @@ void bms_ble_init(void) {
 	esp_ble_gattc_register_callback(gattc_event_handler);
 	esp_ble_gattc_app_register(BMS_GATTC_APP_ID);
 
-	xTaskCreatePinnedToCore(bms_ble_task, "bms_ble", 3584, NULL, 6, &m_task, tskNO_AFFINITY);
+	xTaskCreatePinnedToCore(bms_ble_task, "bms_ble", 6144, NULL, 6, &m_task, tskNO_AFFINITY);
 }
 
 bool bms_ble_available(void) {
@@ -1690,7 +1729,7 @@ static lbm_value ext_scanning(lbm_value *args, lbm_uint argn) {
 static lbm_value ext_scan_results(lbm_value *args, lbm_uint argn) {
 	(void)args; (void)argn;
 
-	bms_ble_scan_entry_t entries[BMS_BLE_SCAN_MAX];
+	static bms_ble_scan_entry_t entries[BMS_BLE_SCAN_MAX]; // lisp extensions run on one thread
 	int n = bms_ble_scan_results(entries, BMS_BLE_SCAN_MAX);
 
 	lbm_value res = ENC_SYM_NIL;
@@ -1803,39 +1842,42 @@ static lbm_value ext_get(lbm_value *args, lbm_uint argn) {
 		}
 	}
 
-	bms_ble_data_t d;
+	const bms_ble_data_t *d = &m_data;
+	lbm_value res;
 	if (!lock()) {
 		return ENC_SYM_EERROR;
 	}
-	d = m_data;
-	unlock();
 
 	switch (key) {
-	case 0: return lbm_enc_float(d.voltage);
-	case 1: return lbm_enc_float(d.current);
-	case 2: return lbm_enc_float(d.soc);
-	case 3: return lbm_enc_float(d.ah_remain);
-	case 4: return lbm_enc_float(d.ah_nominal);
-	case 5: return lbm_enc_i(d.cycles);
-	case 6: return lbm_enc_i(d.cell_count);
-	case 7: return lbm_enc_i(d.temp_count);
-	case 8: return lbm_enc_float(d.cell_min);
-	case 9: return lbm_enc_float(d.cell_max);
-	case 10: return d.temp_mos_valid ? lbm_enc_float(d.temp_mos) : ENC_SYM_NIL;
-	case 11: return lbm_enc_bool(d.chg_fet);
-	case 12: return lbm_enc_bool(d.dis_fet);
-	case 13: return lbm_enc_u32(d.balance_bits);
-	case 14: return lbm_enc_u32((uint32_t)d.problem);
-	case 15: return lbm_enc_u32(d.msg_count);
-	case 16: return lbm_enc_u32(d.err_count);
-	case 17: return d.valid ? lbm_enc_float(UTILS_AGE_S(d.update_time)) : lbm_enc_float(-1.0f);
-	case 18: return lbm_enc_u32(d.runtime_s);
-	case 19: return lbm_enc_i(d.proto_variant);
-	case 20: return lbm_enc_float(d.soh);
+	case 0: res = lbm_enc_float(d->voltage); break;
+	case 1: res = lbm_enc_float(d->current); break;
+	case 2: res = lbm_enc_float(d->soc); break;
+	case 3: res = lbm_enc_float(d->ah_remain); break;
+	case 4: res = lbm_enc_float(d->ah_nominal); break;
+	case 5: res = lbm_enc_i(d->cycles); break;
+	case 6: res = lbm_enc_i(d->cell_count); break;
+	case 7: res = lbm_enc_i(d->temp_count); break;
+	case 8: res = lbm_enc_float(d->cell_min); break;
+	case 9: res = lbm_enc_float(d->cell_max); break;
+	case 10: res = d->temp_mos_valid ? lbm_enc_float(d->temp_mos) : ENC_SYM_NIL; break;
+	case 11: res = lbm_enc_bool(d->chg_fet); break;
+	case 12: res = lbm_enc_bool(d->dis_fet); break;
+	case 13: res = lbm_enc_u32(d->balance_bits); break;
+	case 14: res = lbm_enc_u32((uint32_t)d->problem); break;
+	case 15: res = lbm_enc_u32(d->msg_count); break;
+	case 16: res = lbm_enc_u32(d->err_count); break;
+	case 17: res = d->valid ? lbm_enc_float(UTILS_AGE_S(d->update_time)) : lbm_enc_float(-1.0f); break;
+	case 18: res = lbm_enc_u32(d->runtime_s); break;
+	case 19: res = lbm_enc_i(d->proto_variant); break;
+	case 20: res = lbm_enc_float(d->soh); break;
 	default:
+		unlock();
 		lbm_set_error_reason("Unknown key");
 		return ENC_SYM_EERROR;
 	}
+
+	unlock();
+	return res;
 }
 
 // (bms-ble-cell i) -> float
