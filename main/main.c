@@ -25,6 +25,7 @@
 
 #include "conf_general.h"
 #include "comm_ble.h"
+#include "bms_ble.h"
 #include "comm_uart.h"
 #include "comm_usb.h"
 #include "comm_can.h"
@@ -144,6 +145,7 @@ void app_main(void) {
 		case BLE_MODE_OPEN:
 		case BLE_MODE_ENCRYPTED: {
 			comm_ble_init();
+			bms_ble_init();
 			break;
 		}
 		case BLE_MODE_SCRIPTING: {

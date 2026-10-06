@@ -66,6 +66,7 @@
 #include "comm_usb.h"
 #include "comm_uart.h"
 #include "comm_ble.h"
+#include "bms_ble.h"
 #include "lbm_image.h"
 #include "packet.h"
 #include "bme280_if.h"
@@ -7006,6 +7007,10 @@ void lispif_load_vesc_extensions(bool main_found) {
 			lispif_load_ble_extensions();
 			#endif
 		}
+
+		#if CONFIG_BT_BLUEDROID_ENABLED
+		bms_ble_load_extensions();
+		#endif
 
 		// CAN-Messages
 		lbm_add_extension("canmsg-recv", ext_canmsg_recv);

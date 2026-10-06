@@ -49,6 +49,7 @@
 #include "commands.h"
 #include "conf_general.h"
 #include "main.h"
+#include "bms_ble.h"
 
 #if CONFIG_BT_BLUEDROID_ENABLED
 
@@ -491,6 +492,8 @@ static void gatts_check_callback(
 static void gap_event_handler(
 	esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param
 ) {
+	bms_ble_gap_event(event, param);
+
 	switch (event) {
 		case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
 			adv_config_done &= (~ADV_CFG_FLAG);

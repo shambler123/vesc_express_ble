@@ -18,6 +18,7 @@
 	*/
 
 #include "custom_ble.h"
+#include "bms_ble.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -386,6 +387,8 @@ static void gap_event_handler(
 ) {
 	STORED_LOGF("gap event %d", event);
 
+	bms_ble_gap_event(event, param);
+
 	switch (event) {
 		case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
 		case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT: {
@@ -680,6 +683,7 @@ custom_ble_result_t custom_ble_start() {
 	esp_ble_gatts_register_callback(gatts_event_handler);
 	esp_ble_gap_register_callback(gap_event_handler);
 	esp_ble_gatts_app_register(0);
+	bms_ble_init();
 
 	has_started = true;
 
