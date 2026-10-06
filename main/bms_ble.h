@@ -126,6 +126,7 @@ bool bms_ble_target(uint8_t addr[6], bms_ble_type_t *type);
 const bms_ble_data_t *bms_ble_get_data(void);
 void bms_ble_set_update_vesc(bool enabled);
 void bms_ble_set_debug(bool enabled);
+void bms_ble_set_send_can(bool enabled);
 
 void bms_ble_load_extensions(void);
 

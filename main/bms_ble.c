@@ -117,6 +117,7 @@ static SemaphoreHandle_t m_rx_sem = NULL;
 static TaskHandle_t m_task = NULL;
 static volatile bool m_debug = false;
 static volatile bool m_update_vesc = true;
+static volatile bool m_send_can = true;
 
 // Debug lines are queued here and printed by the supervisor task, since
 // commands_printf_lisp needs more stack than the Bluetooth task offers.
@@ -1354,6 +1355,10 @@ static bool proto_poll(void) {
 
 	if (m_update_vesc) {
 		update_vesc_bms();
+		if (m_send_can) {
+			// Forward to the VESC on the CAN bus, like the OW BMS bridge does
+			bms_send_status_can();
+		}
 	}
 
 	return true;
@@ -1621,6 +1626,10 @@ void bms_ble_set_update_vesc(bool enabled) {
 
 void bms_ble_set_debug(bool enabled) {
 	m_debug = enabled;
+}
+
+void bms_ble_set_send_can(bool enabled) {
+	m_send_can = enabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -1906,6 +1915,12 @@ static lbm_value ext_set_update_vesc(lbm_value *args, lbm_uint argn) {
 	return ENC_SYM_TRUE;
 }
 
+static lbm_value ext_set_send_can(lbm_value *args, lbm_uint argn) {
+	LBM_CHECK_ARGN(1);
+	bms_ble_set_send_can(lbm_dec_bool(args[0]));
+	return ENC_SYM_TRUE;
+}
+
 static lbm_value ext_debug(lbm_value *args, lbm_uint argn) {
 	LBM_CHECK_ARGN(1);
 	bms_ble_set_debug(lbm_dec_bool(args[0]));
@@ -1941,6 +1956,7 @@ void bms_ble_load_extensions(void) {
 	lbm_add_extension("bms-ble-cell", ext_cell);
 	lbm_add_extension("bms-ble-temp", ext_temp);
 	lbm_add_extension("bms-ble-set-update-vesc", ext_set_update_vesc);
+	lbm_add_extension("bms-ble-set-send-can", ext_set_send_can);
 	lbm_add_extension("bms-ble-debug", ext_debug);
 }
 
@@ -1961,6 +1977,7 @@ static bms_ble_data_t m_data_stub;
 const bms_ble_data_t *bms_ble_get_data(void) { return &m_data_stub; }
 void bms_ble_set_update_vesc(bool enabled) { (void)enabled; }
 void bms_ble_set_debug(bool enabled) { (void)enabled; }
+void bms_ble_set_send_can(bool enabled) { (void)enabled; }
 void bms_ble_load_extensions(void) {}
 
 #endif

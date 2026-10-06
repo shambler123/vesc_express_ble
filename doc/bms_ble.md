@@ -53,7 +53,8 @@ connection keeps working at the same time, both links share the radio.
 (bms-ble-get key)               ; see below
 (bms-ble-cell i)                ; cell voltage
 (bms-ble-temp i)                ; temperature sensor
-(bms-ble-set-update-vesc bool)
+(bms-ble-set-update-vesc bool)  ; mirror into the VESC BMS values (default t)
+(bms-ble-set-send-can bool)     ; forward the values to the VESC over CAN after each poll (default t)
 (bms-ble-debug bool)            ; print connection progress to the REPL
 ```
 
