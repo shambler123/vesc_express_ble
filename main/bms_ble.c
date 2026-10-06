@@ -603,6 +603,11 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 			m_conn.open = true;
 			m_conn.conn_id = param->open.conn_id;
 			memcpy(m_conn.bda, param->open.remote_bda, 6);
+			if (!m_target_set || !m_auto_reconnect) {
+				DBG("Open ok but target was forgotten, closing");
+				esp_ble_gattc_close(gattc_if, m_conn.conn_id);
+				break;
+			}
 			DBG("Open ok, conn_id %d", m_conn.conn_id);
 			m_target_addr_known = true;
 			// One GATT procedure at a time: the service search starts in
@@ -1458,7 +1463,10 @@ static void bms_ble_task(void *arg) {
 			break;
 
 		case BMS_BLE_STATE_IDLE:
-			if (m_target_set && m_auto_reconnect && !m_conn.open && !m_open_requested &&
+			if (m_conn.open && (!m_target_set || !m_auto_reconnect)) {
+				// Link survived a disconnect/forget request, drop it
+				esp_ble_gattc_close(m_gattc_if, m_conn.conn_id);
+			} else if (m_target_set && m_auto_reconnect && !m_conn.open && !m_open_requested &&
 					age_ms(m_last_attempt) > retry_delay()) {
 				begin_connect();
 			}
@@ -1613,11 +1621,21 @@ bool bms_ble_connect(const uint8_t addr[6], bms_ble_type_t type) {
 void bms_ble_disconnect(void) {
 	m_auto_reconnect = false;
 	m_target_set = false;
+	m_target_addr_known = false;
+	m_open_after_scan_stop = false;
+	m_open_after_params = false;
 	if (m_conn.open) {
 		esp_ble_gattc_close(m_gattc_if, m_conn.conn_id);
 	}
+	if (m_scanning && !m_scan_user) {
+		esp_ble_gap_stop_scanning();
+	}
 	if (m_state == BMS_BLE_STATE_CONNECTING) {
 		m_state = BMS_BLE_STATE_IDLE;
+	}
+	if (lock()) {
+		m_data.valid = false;
+		unlock();
 	}
 }
 
