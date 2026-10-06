@@ -492,6 +492,9 @@ static void gatts_event_handler(
 			break;
 		}
 		case ESP_GATTS_MTU_EVT: {
+			if (is_connected && param->mtu.conn_id != conn_id) {
+				break; // Another link (BMS client connection)
+			}
 			ble_current_mtu = param->mtu.mtu;
 
 			break;
@@ -509,6 +512,11 @@ static void gatts_event_handler(
 			break;
 		}
 		case ESP_GATTS_CONNECT_EVT: {
+			// Links opened by this device as GATT client (bms_ble) show up
+			// here too, with link_role 0. Only slave links are app clients.
+			if (param->connect.link_role != 1) {
+				break;
+			}
 			conn_id      = param->connect.conn_id;
 			is_connected = true;
 
@@ -541,6 +549,9 @@ static void gatts_event_handler(
 			break;
 		}
 		case ESP_GATTS_DISCONNECT_EVT: {
+			if (!is_connected || param->disconnect.conn_id != conn_id) {
+				break; // Not the client link
+			}
 			is_connected = false;
 			LED_BLUE_OFF();
 

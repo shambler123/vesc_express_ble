@@ -579,6 +579,9 @@ static void gatts_event_handler(
 
 		case ESP_GATTS_EXEC_WRITE_EVT:
 		case ESP_GATTS_MTU_EVT:
+			if (is_connected && param->mtu.conn_id != gatts_profile.conn_id) {
+				break; // Another link (BMS client connection)
+			}
 			if (param->mtu.mtu == 0) {
 				ble_current_mtu = 20;
 			} else if (param->mtu.mtu > GATTS_CHAR_VAL_LEN_MAX) {
@@ -651,6 +654,13 @@ static void gatts_event_handler(
 			break;
 
 		case ESP_GATTS_CONNECT_EVT:
+			// Bluedroid reports every link here, also the ones this device
+			// opens itself as GATT client (bms_ble). Only a link where we are
+			// the slave is a VESC Tool connection.
+			if (param->connect.link_role != 1) {
+				break;
+			}
+
 			if (backup.config.ble_mode == BLE_MODE_ENCRYPTED) {
 				esp_ble_set_encryption(
 					param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT_MITM
@@ -675,6 +685,9 @@ static void gatts_event_handler(
 			break;
 
 		case ESP_GATTS_DISCONNECT_EVT:
+			if (!is_connected || param->disconnect.conn_id != gatts_profile.conn_id) {
+				break; // Not the VESC Tool link
+			}
 			is_connected = false;
 			notify_gatts_if = ESP_GATT_IF_NONE;
 			notify_conn_id = 0;
