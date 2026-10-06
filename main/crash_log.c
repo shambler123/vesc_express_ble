@@ -43,6 +43,8 @@ typedef struct {
 	char reason[CRASH_LOG_STR_LEN];
 	char description[CRASH_LOG_STR_LEN];
 	char task[CRASH_LOG_STR_LEN];
+	char details[CRASH_LOG_DETAILS_LEN];
+	uint32_t uptime_ms;
 } crash_rtc_t;
 
 static RTC_NOINIT_ATTR crash_rtc_t m_rtc;
@@ -58,6 +60,10 @@ static void copy_str(char *dst, const char *src) {
 }
 
 void __real_esp_panic_handler(panic_info_t *info);
+
+// Set by esp_system_abort() before the panic handler runs (esp_system/panic.c)
+extern bool g_panic_abort;
+extern char *g_panic_abort_details;
 
 // Runs in panic context: no allocation, no locks, keep it short.
 void __wrap_esp_panic_handler(panic_info_t *info) {
@@ -83,6 +89,14 @@ void __wrap_esp_panic_handler(panic_info_t *info) {
 	TaskHandle_t t = xTaskGetCurrentTaskHandleForCore(info->core);
 	copy_str(m_rtc.task, t ? pcTaskGetName(t) : NULL);
 
+	// abort() and failed asserts pass their message here
+	m_rtc.details[0] = '\0';
+	if (g_panic_abort && g_panic_abort_details) {
+		strncpy(m_rtc.details, g_panic_abort_details, CRASH_LOG_DETAILS_LEN - 1);
+		m_rtc.details[CRASH_LOG_DETAILS_LEN - 1] = '\0';
+	}
+	m_rtc.uptime_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
 	__real_esp_panic_handler(info);
 }
 
@@ -100,6 +114,9 @@ void crash_log_init(void) {
 		memcpy(m_log.reason, m_rtc.reason, CRASH_LOG_STR_LEN);
 		memcpy(m_log.description, m_rtc.description, CRASH_LOG_STR_LEN);
 		memcpy(m_log.task, m_rtc.task, CRASH_LOG_STR_LEN);
+		memcpy(m_log.details, m_rtc.details, CRASH_LOG_DETAILS_LEN);
+		m_log.details[CRASH_LOG_DETAILS_LEN - 1] = '\0';
+		m_log.uptime_ms = m_rtc.uptime_ms;
 		m_log.reason[CRASH_LOG_STR_LEN - 1] = '\0';
 		m_log.description[CRASH_LOG_STR_LEN - 1] = '\0';
 		m_log.task[CRASH_LOG_STR_LEN - 1] = '\0';

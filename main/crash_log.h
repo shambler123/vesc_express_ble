@@ -30,6 +30,7 @@
 #include <stdbool.h>
 
 #define CRASH_LOG_STR_LEN	40
+#define CRASH_LOG_DETAILS_LEN	120
 
 typedef struct {
 	bool valid;			// A crash record exists from the previous run
@@ -42,6 +43,8 @@ typedef struct {
 	char reason[CRASH_LOG_STR_LEN];
 	char description[CRASH_LOG_STR_LEN];
 	char task[CRASH_LOG_STR_LEN];
+	char details[CRASH_LOG_DETAILS_LEN];	// abort()/assert message, if any
+	uint32_t uptime_ms;						// time since boot when it crashed
 } crash_log_t;
 
 // Call once early at boot, takes the snapshot and clears the RTC record

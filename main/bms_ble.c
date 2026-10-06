@@ -2007,7 +2007,7 @@ static lbm_value ext_stats(lbm_value *args, lbm_uint argn) {
 	return res;
 }
 
-// (crash-info) -> nil, or (reason description task pc ra sp mcause mtval) of the last panic
+// (crash-info) -> nil, or (reason description task pc ra sp mcause mtval details uptime-s) of the last panic
 static lbm_value ext_crash_info(lbm_value *args, lbm_uint argn) {
 	(void)args; (void)argn;
 	const crash_log_t *c = crash_log_get();
@@ -2015,6 +2015,12 @@ static lbm_value ext_crash_info(lbm_value *args, lbm_uint argn) {
 		return ENC_SYM_NIL;
 	}
 	lbm_value res = ENC_SYM_NIL;
+	lbm_value details = make_str(c->details);
+	if (details == ENC_SYM_MERROR) {
+		return ENC_SYM_MERROR;
+	}
+	res = lbm_cons(lbm_enc_u32(c->uptime_ms / 1000), res);
+	res = lbm_cons(details, res);
 	res = lbm_cons(lbm_enc_u32(c->mtval), res);
 	res = lbm_cons(lbm_enc_u32(c->mcause), res);
 	res = lbm_cons(lbm_enc_u32(c->sp), res);
