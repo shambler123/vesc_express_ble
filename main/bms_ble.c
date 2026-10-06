@@ -52,8 +52,8 @@
 #define RX_BUF_SIZE				320
 #define CMD_TIMEOUT_MS			1500
 #define POLL_INTERVAL_MS		1000
-#define TARGET_SCAN_MS			8000	// Scan this long for the target before trying a direct connect
-#define CONNECT_TIMEOUT_MS		20000	// Bluedroid connect timeout is CONFIG_BT_BLE_ESTAB_LINK_CONN_TOUT (8 s) + discovery
+#define TARGET_SCAN_MS			10000	// Scan this long for the target before trying a direct connect
+#define CONNECT_TIMEOUT_MS		20000	// Bluedroid connect timeout is CONFIG_BT_BLE_ESTAB_LINK_CONN_TOUT (5 s) + discovery
 #define RECONNECT_DELAY_MS		3000	// First retry, doubles on every failure up to RECONNECT_DELAY_MAX_MS
 #define RECONNECT_DELAY_MAX_MS	60000
 #define RECONNECT_DELAY_PHONE_MS 10000	// Minimum retry delay while VESC Tool is connected
@@ -70,8 +70,11 @@
 #define SCAN_WINDOW_FREE		0x20	// 20 ms (40 %)
 #define SCAN_INTERVAL_BUSY		0xA0	// 100 ms
 #define SCAN_WINDOW_BUSY		0x10	// 10 ms (10 %)
-#define SCAN_INTERVAL_LOW		0x140	// 200 ms
-#define SCAN_WINDOW_LOW			0x10	// 10 ms (5 %)
+#define SCAN_INTERVAL_LOW		0xA0	// 100 ms
+#define SCAN_WINDOW_LOW			0x14	// 20 ms (20 %), passive, used while looking for the BMS
+#define SCAN_INTERVAL_INIT		0x30	// 30 ms
+#define SCAN_WINDOW_INIT		0x30	// 30 ms (100 %), only while the controller initiates the
+										// connection, bounded by CONFIG_BT_BLE_ESTAB_LINK_CONN_TOUT
 
 // Connection parameters for the BMS link. Discovery runs at 100 to 150 ms,
 // afterwards the link is slowed down to 200 to 300 ms since the BMS is only
@@ -256,14 +259,29 @@ static bool any_link_busy(void) {
 // Scanning
 // ---------------------------------------------------------------------------
 
-static void scan_apply_params(bool user) {
+typedef enum {
+	SCAN_MODE_USER = 0,		// device list, active
+	SCAN_MODE_FIND,			// looking for the configured BMS, passive, low duty
+	SCAN_MODE_INIT,			// connection initiation, full duty for a few seconds
+} scan_mode_t;
+
+static void scan_apply_params(scan_mode_t mode) {
 	bool busy = any_link_busy();
+	uint16_t interval, window;
+	switch (mode) {
+	case SCAN_MODE_INIT: interval = SCAN_INTERVAL_INIT; window = SCAN_WINDOW_INIT; break;
+	case SCAN_MODE_FIND: interval = SCAN_INTERVAL_LOW; window = SCAN_WINDOW_LOW; break;
+	default:
+		interval = busy ? SCAN_INTERVAL_BUSY : SCAN_INTERVAL_FREE;
+		window = busy ? SCAN_WINDOW_BUSY : SCAN_WINDOW_FREE;
+		break;
+	}
 	esp_ble_scan_params_t p = {
-		.scan_type = user ? BLE_SCAN_TYPE_ACTIVE : BLE_SCAN_TYPE_PASSIVE,
+		.scan_type = mode == SCAN_MODE_USER ? BLE_SCAN_TYPE_ACTIVE : BLE_SCAN_TYPE_PASSIVE,
 		.own_addr_type = BLE_ADDR_TYPE_PUBLIC,
 		.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
-		.scan_interval = !user ? SCAN_INTERVAL_LOW : (busy ? SCAN_INTERVAL_BUSY : SCAN_INTERVAL_FREE),
-		.scan_window = !user ? SCAN_WINDOW_LOW : (busy ? SCAN_WINDOW_BUSY : SCAN_WINDOW_FREE),
+		.scan_interval = interval,
+		.scan_window = window,
 		.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE,
 	};
 	esp_ble_gap_set_scan_params(&p);
@@ -284,7 +302,7 @@ static bool scan_start_internal(uint32_t seconds, bool user) {
 
 	m_scan_duration_s = seconds;
 	m_scan_params_pending = true;
-	scan_apply_params(user);
+	scan_apply_params(user ? SCAN_MODE_USER : SCAN_MODE_FIND);
 	return true;
 }
 
@@ -449,15 +467,17 @@ static void do_open(void) {
 	}
 }
 
-// Direct connect without a scan: set the low duty scan parameters first, the
-// controller uses them while initiating.
+// The controller uses the scan parameters while it initiates the connection,
+// so switch to the full duty window right before the open. The attempt is
+// bounded by CONFIG_BT_BLE_ESTAB_LINK_CONN_TOUT and the retry backoff keeps
+// the average radio load low.
 static void request_open(void) {
 	if (m_scanning) {
 		m_open_after_scan_stop = true;
 		esp_ble_gap_stop_scanning();
 	} else {
 		m_open_after_params = true;
-		scan_apply_params(false);
+		scan_apply_params(SCAN_MODE_INIT);
 	}
 }
 
@@ -492,7 +512,8 @@ void bms_ble_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 			m_scan_user = false;
 			if (m_open_after_scan_stop) {
 				m_open_after_scan_stop = false;
-				do_open();
+				m_open_after_params = true;
+				scan_apply_params(SCAN_MODE_INIT);
 			}
 		}
 		break;
@@ -502,7 +523,8 @@ void bms_ble_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 		m_scan_user = false;
 		if (m_open_after_scan_stop) {
 			m_open_after_scan_stop = false;
-			do_open();
+			m_open_after_params = true;
+			scan_apply_params(SCAN_MODE_INIT);
 		}
 		break;
 
