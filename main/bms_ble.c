@@ -104,6 +104,16 @@ static const uint8_t UUID_NUS_SVC[16] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA
 static const uint8_t UUID_NUS_TX[16]  = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x02, 0x00, 0x40, 0x6E}; // we write here
 static const uint8_t UUID_NUS_RX[16]  = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x03, 0x00, 0x40, 0x6E}; // notifications
 
+// Stoked Stock / Indy Speed Control BMS ("SSBMS"), protocol taken from the
+// Indy Speed Control app: Modbus-like read requests with the register address
+// echoed in the reply and a CRC-16/XMODEM appended low byte first.
+static const uint8_t UUID_SSBMS_SVC[16] = {0x01, 0x10, 0x2E, 0xC7, 0x8A, 0x0E, 0x73, 0x90, 0xE1, 0x11, 0xC2, 0x08, 0x60, 0x27, 0x00, 0x00};
+static const uint8_t UUID_SSBMS_TX[16]  = {0x01, 0x00, 0x2E, 0xC7, 0x8A, 0x0E, 0x73, 0x90, 0xE1, 0x11, 0xC2, 0x08, 0x60, 0x27, 0x00, 0x00}; // we write here
+static const uint8_t UUID_SSBMS_RX[16]  = {0x02, 0x00, 0x2E, 0xC7, 0x8A, 0x0E, 0x73, 0x90, 0xE1, 0x11, 0xC2, 0x08, 0x60, 0x27, 0x00, 0x00}; // notifications
+#define SSBMS_SLAVE_ID			0x16
+#define SSBMS_REG_TEMPS			0x0000
+#define SSBMS_REG_CELLS			0x0020
+
 #define LITECH_SLAVE_ID			0x01
 #define LITECH_LIVE_ADDR		0xD000
 #define LITECH_LIVE_COUNT		0x3B
@@ -229,6 +239,17 @@ static uint16_t be16(const uint8_t *p) {
 	return ((uint16_t)p[0] << 8) | p[1];
 }
 
+static uint16_t crc_xmodem(const uint8_t *data, int len) {
+	uint16_t crc = 0;
+	for (int i = 0; i < len; i++) {
+		crc ^= (uint16_t)data[i] << 8;
+		for (int b = 0; b < 8; b++) {
+			crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+		}
+	}
+	return crc;
+}
+
 static uint16_t crc_modbus(const uint8_t *data, int len) {
 	uint16_t crc = 0xFFFF;
 	for (int i = 0; i < len; i++) {
@@ -249,6 +270,7 @@ static const char *type_name(bms_ble_type_t t) {
 	case BMS_BLE_TYPE_LITECH: return "litech";
 	case BMS_BLE_TYPE_JK: return "jk";
 	case BMS_BLE_TYPE_ANT: return "ant";
+	case BMS_BLE_TYPE_SSBMS: return "ssbms";
 	default: return "unknown";
 	}
 }
@@ -356,6 +378,11 @@ static bms_ble_type_t type_from_adv(uint8_t *adv, uint16_t len, const uint8_t *n
 	}
 	if (name && name_len >= 3 && memcmp(name, "ANT", 3) == 0) {
 		return BMS_BLE_TYPE_ANT;
+	}
+	for (int i = 0; name && i + 5 <= name_len; i++) {
+		if (memcmp(&name[i], "SSBMS", 5) == 0) {
+			return BMS_BLE_TYPE_SSBMS;
+		}
 	}
 
 	// Daly dongles often advertise no service UUID, only a manufacturer id
@@ -586,6 +613,12 @@ static void discover_chars(void) {
 		memcpy(rx.uuid.uuid128, UUID_NUS_RX, 16);
 		memcpy(tx.uuid.uuid128, UUID_NUS_TX, 16);
 		break;
+	case BMS_BLE_TYPE_SSBMS:
+		rx.len = ESP_UUID_LEN_128;
+		tx.len = ESP_UUID_LEN_128;
+		memcpy(rx.uuid.uuid128, UUID_SSBMS_RX, 16);
+		memcpy(tx.uuid.uuid128, UUID_SSBMS_TX, 16);
+		break;
 	default: break;
 	}
 
@@ -686,6 +719,10 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 					memcmp(param->search_res.srvc_id.uuid.uuid.uuid128, UUID_NUS_SVC, 16) == 0) {
 				t = BMS_BLE_TYPE_LITECH;
 				uuid = 0x6E40;
+			} else if (param->search_res.srvc_id.uuid.len == ESP_UUID_LEN_128 &&
+					memcmp(param->search_res.srvc_id.uuid.uuid.uuid128, UUID_SSBMS_SVC, 16) == 0) {
+				t = BMS_BLE_TYPE_SSBMS;
+				uuid = 0x2760;
 			}
 
 			if (t != BMS_BLE_TYPE_UNKNOWN && (m_target_type == BMS_BLE_TYPE_AUTO || m_target_type == t) &&
@@ -1729,6 +1766,138 @@ static bool ffe0_probe(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Stoked Stock / Indy Speed Control BMS
+// Request:  16 03 <addr BE16> <count BE16> <crc lo> <crc hi>
+// Reply:    16 03 <addr BE16> <byte count> <data...> <crc lo> <crc hi>
+// Registers: 0x0000..0x0002 temperatures (MOSFET, T1, T2) in 0.1 K,
+//            0x0020.. cell voltages in mV. The BMS has no current sensor.
+// ---------------------------------------------------------------------------
+
+static void ssbms_on_rx(void) {
+	if (m_rx_buf[0] != SSBMS_SLAVE_ID || (m_rx_len >= 2 && m_rx_buf[1] != 0x03 && m_rx_buf[1] != 0x83)) {
+		rx_reset();
+		return;
+	}
+	if (m_rx_len >= 2 && m_rx_buf[1] == 0x83) {
+		// Exception reply (unsupported register count), let the poll time out
+		rx_reset();
+		return;
+	}
+	if (m_rx_len < 5) {
+		return;
+	}
+	int total = m_rx_buf[4] + 7;
+	if (total > RX_BUF_SIZE) {
+		rx_reset();
+		return;
+	}
+	if (m_rx_len < total) {
+		return;
+	}
+	if (m_rx_buf[2] != 0x00 || m_rx_buf[3] != m_rx_expect2) {
+		rx_reset();
+		return;
+	}
+	uint16_t crc = crc_xmodem(m_rx_buf, total - 2);
+	uint16_t got = m_rx_buf[total - 2] | (m_rx_buf[total - 1] << 8);
+	if (crc != got) {
+		m_work.err_count++;
+		rx_reset();
+		return;
+	}
+	m_rx_len = total;
+	rx_done();
+}
+
+static bool ssbms_read(uint16_t addr, uint16_t count) {
+	uint8_t f[8] = {SSBMS_SLAVE_ID, 0x03, addr >> 8, addr & 0xFF, count >> 8, count & 0xFF, 0, 0};
+	uint16_t crc = crc_xmodem(f, 6);
+	f[6] = crc & 0xFF;
+	f[7] = crc >> 8;
+	return transact(f, 8, SSBMS_SLAVE_ID, addr & 0xFF);
+}
+
+// SOC estimate from the average cell voltage, same default curve as the app
+static float ssbms_soc_from_cell(float v) {
+	const float pts[5] = {4.25f, 4.00f, 3.60f, 3.20f, 2.70f};
+	const float soc[5] = {1.00f, 0.75f, 0.50f, 0.25f, 0.00f};
+	if (v >= pts[0]) {
+		return 1.0f;
+	}
+	for (int i = 1; i < 5; i++) {
+		if (v >= pts[i]) {
+			return soc[i] + (soc[i - 1] - soc[i]) * (v - pts[i]) / (pts[i - 1] - pts[i]);
+		}
+	}
+	return 0.0f;
+}
+
+static bool ssbms_poll(void) {
+	// The cell count is not reported, the app asks the user for it. Read the
+	// maximum and keep the leading registers that look like a cell, then
+	// remember the count so later polls stay small.
+	int want = m_work.proto_variant > 0 ? m_work.proto_variant : BMS_BLE_MAX_CELLS;
+	bool ok = ssbms_read(SSBMS_REG_CELLS, want);
+	if (!ok && m_work.proto_variant == 0) {
+		const int tries[] = {24, 20, 16, 12};
+		for (int i = 0; i < 4 && !ok; i++) {
+			want = tries[i];
+			ok = ssbms_read(SSBMS_REG_CELLS, want);
+		}
+	}
+	if (!ok) {
+		return false;
+	}
+
+	int avail = m_rx_buf[4] / 2;
+	int nc = 0;
+	float sum = 0.0f;
+	for (int i = 0; i < avail && i < BMS_BLE_MAX_CELLS; i++) {
+		uint16_t mv = be16(&m_rx_buf[5 + i * 2]);
+		if (mv < 1500 || mv > 4600) {
+			break;
+		}
+		m_work.cells[nc++] = mv / 1000.0f;
+		sum += mv / 1000.0f;
+	}
+	if (nc == 0) {
+		return false;
+	}
+	if (m_work.proto_variant == 0) {
+		m_work.proto_variant = nc;
+		DBG("SSBMS: %d cells", nc);
+	}
+	m_work.cell_count = nc;
+	m_work.voltage = sum;
+	m_work.current = 0.0f; // Charge-only BMS without current measurement
+	m_work.soc = ssbms_soc_from_cell(sum / nc);
+	m_work.chg_fet = true;
+	m_work.dis_fet = true;
+	m_work.balance_bits = 0;
+	m_work.problem = 0;
+
+	// Temperatures: MOSFET, T1, T2 in 0.1 K
+	m_work.temp_count = 0;
+	m_work.temp_mos_valid = false;
+	if (ssbms_read(SSBMS_REG_TEMPS, 6) && m_rx_buf[4] >= 6) {
+		uint16_t mos = be16(&m_rx_buf[5]);
+		if (mos > 0) {
+			m_work.temp_mos = mos / 10.0f - 273.15f;
+			m_work.temp_mos_valid = true;
+		}
+		for (int i = 0; i < 2; i++) {
+			uint16_t raw = be16(&m_rx_buf[7 + i * 2]);
+			if (raw > 0) {
+				m_work.temps[m_work.temp_count++] = raw / 10.0f - 273.15f;
+			}
+		}
+	} else {
+		m_work.err_count--; // Optional
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Protocol dispatch
 // ---------------------------------------------------------------------------
 
@@ -1770,6 +1939,9 @@ static void proto_on_rx(const uint8_t *data, uint16_t len) {
 			ant_on_rx();
 		}
 		break;
+	case BMS_BLE_TYPE_SSBMS:
+		ssbms_on_rx();
+		break;
 	default:
 		m_rx_len = 0;
 		break;
@@ -1788,6 +1960,7 @@ static bool proto_poll(void) {
 		case BMS_BLE_TYPE_LITECH: ok = litech_poll(); break;
 		case BMS_BLE_TYPE_JK: ok = jk_poll(); break;
 		case BMS_BLE_TYPE_ANT: ok = ant_poll(); break;
+		case BMS_BLE_TYPE_SSBMS: ok = ssbms_poll(); break;
 		default: break;
 		}
 	}
@@ -2128,7 +2301,7 @@ void bms_ble_set_send_can(bool enabled) {
 // LispBM extensions
 // ---------------------------------------------------------------------------
 
-static lbm_uint sym_auto, sym_jbd, sym_daly, sym_lipower, sym_litech, sym_jk, sym_ant, sym_unknown;
+static lbm_uint sym_auto, sym_jbd, sym_daly, sym_lipower, sym_litech, sym_jk, sym_ant, sym_ssbms, sym_unknown;
 static lbm_uint sym_disabled, sym_idle, sym_connecting, sym_connected;
 
 typedef struct {
@@ -2165,6 +2338,7 @@ static lbm_value type_sym(bms_ble_type_t t) {
 	case BMS_BLE_TYPE_LITECH: return lbm_enc_sym(sym_litech);
 	case BMS_BLE_TYPE_JK: return lbm_enc_sym(sym_jk);
 	case BMS_BLE_TYPE_ANT: return lbm_enc_sym(sym_ant);
+	case BMS_BLE_TYPE_SSBMS: return lbm_enc_sym(sym_ssbms);
 	default: return lbm_enc_sym(sym_unknown);
 	}
 }
@@ -2181,6 +2355,7 @@ static bool sym_to_type(lbm_value v, bms_ble_type_t *t) {
 	else if (s == sym_litech) *t = BMS_BLE_TYPE_LITECH;
 	else if (s == sym_jk) *t = BMS_BLE_TYPE_JK;
 	else if (s == sym_ant) *t = BMS_BLE_TYPE_ANT;
+	else if (s == sym_ssbms) *t = BMS_BLE_TYPE_SSBMS;
 	else return false;
 	return true;
 }
@@ -2475,6 +2650,7 @@ void bms_ble_load_extensions(void) {
 	lbm_add_symbol_const("litech", &sym_litech);
 	lbm_add_symbol_const("jk", &sym_jk);
 	lbm_add_symbol_const("ant", &sym_ant);
+	lbm_add_symbol_const("ssbms", &sym_ssbms);
 	lbm_add_symbol_const("unknown", &sym_unknown);
 	lbm_add_symbol_const("disabled", &sym_disabled);
 	lbm_add_symbol_const("idle", &sym_idle);

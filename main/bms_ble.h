@@ -31,6 +31,8 @@
  *   - LiTech "BT-BMS-xxxx"               (Nordic UART service, Modbus RTU slave 1, live data at 0xD000)
  *   - JK / Jikong                        (service 0xFFE0, notify+write 0xFFE1, JK02 24S/32S records)
  *   - ANT                                (service 0xFFE0, notify+write 0xFFE1, 0x7EA1 protocol or legacy 0xDBDB)
+ *   - Stoked Stock / Indy Speed Control  (service 00002760-08c2-11e1-9073-0e8ac72e1001, write ...e0001,
+ *     "SSBMS"                             notify ...e0002, Modbus-like slave 0x16 with CRC-16/XMODEM)
  *
  * 0xFFE0 is shared by LiPower, JK and ANT. With type 'auto the protocols are
  * probed in the order JK, ANT, ANT legacy, LiPower after the connection is up.
@@ -56,6 +58,7 @@ typedef enum {
 	BMS_BLE_TYPE_LITECH,
 	BMS_BLE_TYPE_JK,
 	BMS_BLE_TYPE_ANT,
+	BMS_BLE_TYPE_SSBMS,
 	BMS_BLE_TYPE_UNKNOWN,
 } bms_ble_type_t;
 

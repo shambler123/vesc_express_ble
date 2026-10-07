@@ -16,6 +16,7 @@ connection keeps working at the same time, both links share the radio.
 | `lipower` | 0xFFE0, notify + write 0xFFE1          | LiPower / Ective, Modbus register 0x0400. Only pack values, no cell voltages. |
 | `jk`      | 0xFFE0, notify + write 0xFFE1          | JK / Jikong JK02 records (300 bytes). Device info is read first, the layout depends on the firmware version (24S below V11, 32S from V11). Names `JK-*`, manufacturer ids 0x0B65 / 0x4B4A. |
 | `ant`     | 0xFFE0, notify + write 0xFFE1          | ANT, protocol `7E A1` (status 0x01) and legacy `DB DB` (140 byte status), auto-detected. Names `ANT*`. |
+| `ssbms`   | 00002760-08c2-11e1-9073-0e8ac72e1001, write ...e0001, notify ...e0002 | Stoked Stock / Indy Speed Control BMS (name contains `SSBMS`). Modbus-like reads from slave 0x16 with CRC-16/XMODEM: cells at register 0x0020 (mV), temperatures MOSFET/T1/T2 at 0x0000 (0.1 K). Charge-only, no current sensor, SOC is estimated from the average cell voltage with the app's default curve. Protocol taken from the app, not hardware-tested. |
 | `litech`  | Nordic UART 6e400001, notify 6e400003, write 6e400002 | LiTech "BT-BMS-xxxx" (Silicon Labs module), Modbus RTU slave 1, live block 0xD000..0xD03A: 32 cell registers (0xEE49 = unused), pack voltage, 4 temperatures, SOC, SOH, remaining / design capacity, cycles. The current register is not verified yet, 0xD032 is used. |
 
 0xFFE0 is shared by LiPower, JK and ANT. With type `auto` the firmware probes
@@ -48,10 +49,10 @@ right protocol.
 (bms-ble-scan [seconds])        ; start a scan, returns immediately
 (bms-ble-scanning)              ; t while the scan runs
 (bms-ble-scan-stop)
-(bms-ble-scan-results)          ; ((name mac rssi type) ...), type is 'jbd 'daly 'lipower 'litech 'jk 'ant or 'unknown
+(bms-ble-scan-results)          ; ((name mac rssi type) ...), type is 'jbd 'daly 'lipower 'litech 'jk 'ant 'ssbms or 'unknown
                                 ; detected from the advertised service UUID, the Daly manufacturer id or the
                                 ; name prefix (JBD-, DL-, BT-BMS-)
-(bms-ble-connect mac [type])    ; mac as "A5:C2:37:17:C7:1A", type 'auto (default) 'jbd 'daly 'lipower 'litech 'jk 'ant
+(bms-ble-connect mac [type])    ; mac as "A5:C2:37:17:C7:1A", type 'auto (default) 'jbd 'daly 'lipower 'litech 'jk 'ant 'ssbms
 (bms-ble-disconnect)            ; disconnect and stop reconnecting
 (bms-ble-connected)
 (bms-ble-state)                 ; 'disabled 'idle 'connecting 'connected
